@@ -9,7 +9,7 @@ def main():
     client = RemoteAPIClient()
     sim = client.getObject('sim')
     
-    # 1. Definição dos Caminhos (Baseado na sua Scene Hierarchy)
+    # 1. Definição dos Caminhos 
    
     try:
         robot = sim.getObject('/Cuboid')
