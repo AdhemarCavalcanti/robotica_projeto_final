@@ -10,7 +10,7 @@ def main():
     sim = client.getObject('sim')
     
     # 1. Definição dos Caminhos (Baseado na sua Scene Hierarchy)
-    # Na sua imagem, os itens estão dentro de /Cuboid
+   
     try:
         robot = sim.getObject('/Cuboid')
         m_dir = sim.getObject('/Cuboid/MOTOR_DIREITO')
@@ -32,7 +32,7 @@ def main():
 
     # 2. Inicialização de Parâmetros
     config = Config()
-    # Define o alvo (ajuste as coordenadas X e Y conforme desejar)
+    # Define o alvo (ajuste as coordenadas X e Y )
     goal = np.array([3.0, 3.0]) 
     # Estado inicial: [x, y, yaw, v, w]
     x = np.array([0.0, 0.0, 0.0, 0.0, 0.0]) 
@@ -63,7 +63,7 @@ def main():
             ob = np.array(ob_list) if ob_list else np.array([[99.0, 99.0]])
 
             # --- PROCESSAMENTO (DWA) ---
-            # O coração do método: escolhe a melhor velocidade desviando dos obstáculos
+            #  escolhe a melhor velocidade desviando dos obstáculos
             u = dwa_control(x, config, goal, ob)
 
             # --- AÇÃO (Cinemática Diferencial) ---
