@@ -2,58 +2,60 @@ import math
 
 class DWA_Planner:
     def __init__(self):
-        # Limites dinâmicos mais agressivos para contornar L's
-        self.max_v = 0.20        # Aumentada para dar velocidade em retas
-        self.min_v = -0.10       # Permitir ré suave para o robô sair do L se entrar
-        self.max_w = 0.9         # Aumentada para dar giros rápidos
+        self.max_v = 0.20        
+        self.min_v = 0.0         # PROIBIDA A RÉ: Mínimo é zero absoluto
+        self.max_w = 1.4         # Aumentado para giros mais rápidos e responsivos no eixo
         
         self.v_passos = 5
-        self.w_passos = 16       # Resolução angular
+        self.w_passos = 24       # Resolução angular muito alta para varredura de quinas
         
-        # Pesos da Função de Custo REVISADOS para esse cenário
-        self.peso_alvo = 3.2       # Atração ao Dummy
-        self.peso_velocidade = 0.4 # Queremos que ele ande rápido
-        self.peso_obstaculo = 5.5  # Peso ALTO para evitar quinas (era 4.0)
+        # Pesos da Função de Custo
+        self.peso_alvo = 3.5       
+        self.peso_velocidade = 0.5 
+        self.peso_obstaculo = 6.0  
         
-        self.raio_colisao = 0.35    # Distância de segurança do chassi para contornar as paredes em L
+        # Raio de colisão ajustado para o chassi do robô (diâmetro ~0.25m)
+        self.raio_colisao = 0.14   
 
     def planejar(self, x_rob, y_rob, yaw_rob, x_alvo, y_alvo, obstaculos):
         melhor_v = 0.0
         melhor_w = 0.0
         melhor_custo = -float('inf')
         
-        # Cria a janela dinâmica de velocidades de busca
-        lista_v = [i * (self.max_v - self.min_v) / self.v_passos + self.min_v for i in range(self.v_passos + 1)]
+        # Força a amostragem a conter APENAS 0.0 ou velocidades estritamente para frente
+        # Remove qualquer chance de ruído de ponto flutuante gerar valores negativos
+        lista_v = [0.0]
+        passo_v = self.max_v / self.v_passos
+        for i in range(1, self.v_passos + 1):
+            lista_v.append(max(0.05, i * passo_v)) # O menor movimento para frente será de 0.05m/s
+            
         lista_w = [i * (2 * self.max_w) / self.w_passos - self.max_w for i in range(self.w_passos + 1)]
         
         for v in lista_v:
             for w in lista_w:
-                dt = 0.6
-                # Projeção cinemática de onde o robô estaria no futuro
+                dt = 0.4  # Janela de previsão curta para evitar colisões em ambientes confinados
+                
+                # Projeção cinemática
                 proximo_x = x_rob + v * math.cos(yaw_rob) * dt
                 proximo_y = y_rob + v * math.sin(yaw_rob) * dt
                 proximo_yaw = yaw_rob + w * dt
                 
                 min_dist_obstaculo = float('inf')
-                # Varre os obstáculos lidos pelos feixes rosas nas quinas das paredes L
                 for ob in obstaculos:
                     dist = math.hypot(proximo_x - ob[0], proximo_y - ob[1])
                     if dist < min_dist_obstaculo:
                         min_dist_obstaculo = dist
                 
-                # Se colidir ou invadir o raio de segurança, descarta a trajetória
+                # Se a velocidade 'v' testada levar a uma colisão, rejeita essa combinação
                 if min_dist_obstaculo < self.raio_colisao:
                     continue
                 
-                # Geometria do vetor até o Alvo Dummy
+                # Cálculo de aproximação do alvo
                 dx = x_alvo - proximo_x
                 dy = y_alvo - proximo_y
                 angulo_alvo = math.atan2(dy, dx)
-                
-                # Diferença angular normalizada entre -PI e +PI
                 erro_rumo = math.atan2(math.sin(angulo_alvo - proximo_yaw), math.cos(angulo_alvo - proximo_yaw))
                 
-                # Função de custo: Maximizar alinhamento e velocidade, minimizando proximidade à mureta L
                 custo_alvo = math.pi - abs(erro_rumo)
                 custo_vel = v
                 custo_ob = min_dist_obstaculo if min_dist_obstaculo != float('inf') else 1.5
