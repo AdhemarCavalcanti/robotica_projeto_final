@@ -19,7 +19,7 @@ class DifferentialRobot:
             except:
                 print(f"[AVISO] Sensor /{nome} não foi localizado na Scene Hierarchy.")
         
-        self.raio_roda = 0.035       
+        self.raio_roda = 0.035      
         self.distancia_eixos = 0.25   
 
     def obter_posicao_objeto(self, nome_objeto):
@@ -53,9 +53,21 @@ class DifferentialRobot:
                 leituras[nome] = float('inf')
         return leituras
 
-    def mover(self, v_linear, w_angular):
+    def mover(self, v_linear, w_angular, forçar_avanco=False):
+        # Conversão cinemática inversa diferencial padrão
         vel_rod_esquerda = (v_linear - (w_angular * self.distancia_eixos / 2.0)) / self.raio_roda
         vel_rod_direita = (v_linear + (w_angular * self.distancia_eixos / 2.0)) / self.raio_roda
+        
+        # BLINDAGEM ANTI-RÉ: Se ativado, impede fisicamente qualquer rotação reversa nas rodas
+        if forçar_avanco:
+            if vel_rod_esquerda < 0: vel_rod_esquerda = 0.0
+            if vel_rod_direita < 0: vel_rod_direita = 0.0
+            
+            # Força torque estrito de avanço na roda externa caso fiquem nulas
+            if vel_rod_esquerda == 0.0 and vel_rod_direita == 0.0:
+                if w_angular > 0: vel_rod_direita = 2.5
+                else: vel_rod_esquerda = 2.5
+
         self.sim.setJointTargetVelocity(self.motor_esquerdo, vel_rod_esquerda)
         self.sim.setJointTargetVelocity(self.motor_direito, vel_rod_direita)
 

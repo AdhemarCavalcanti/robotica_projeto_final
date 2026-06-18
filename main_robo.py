@@ -66,7 +66,7 @@ def main():
     distancia_ponto_impacto = float('inf')
     
     print("=" * 60)
-    print(" [SISTEMA BLINDADO] GIRO FORÇADO NO EIXO SEM LOGICA DE RÉ")
+    print(" [SISTEMA BLINDADO] GIRO PIVOTADO - ZERO MARCHA RÉ")
     print("=" * 60)
 
     while True:
@@ -85,7 +85,7 @@ def main():
             sim.stopSimulation()
             break 
 
-        # Rastreamento dinâmico se o alvo mudar de posição
+        # Reseta busca se o alvo mudar dinamicamente de lugar
         if math.hypot(x_alvo - x_alvo_antigo, y_alvo - y_alvo_antigo) > 0.4:
             x_ini, y_ini = x_atual, y_atual
             x_alvo_antigo, y_alvo_antigo = x_alvo, y_alvo
@@ -99,21 +99,24 @@ def main():
         angulo_alvo = math.atan2(dy, dx)
         erro_rumo = math.atan2(math.sin(angulo_alvo - yaw_atual), math.cos(angulo_alvo - yaw_atual))
 
-        # ─── REGRA SUPREMA: APONTAR DIRETAMENTE PARA O ALVO SE ELE MUDAR ───
+        # ─── REALINHAMENTO INICIAL/CRÍTICO NO PRÓPRIO EIXO SEGURO ───
         if abs(erro_rumo) > math.radians(45):
-            # Força o robô a girar estritamente parado no lugar até alinhar com o vetor do alvo
-            velocidade_giro = 1.3 if erro_rumo > 0 else -1.3
-            robo.mover(0.0, velocidade_giro)
-            sys.stdout.write(f"\r[RASTREAMENTO] Alvo mudou! Girando no eixo: {math.degrees(erro_rumo):.1f}°   ")
+            velocidade_giro = 1.4 if erro_rumo > 0 else -1.4
+            # Ativa a trava anti-ré mesmo girando parado para alinhar com o alvo
+            robo.mover(0.0, velocidade_giro, forçar_avanco=True)
+            sys.stdout.write(f"\r[ALINHAMENTO] Buscando ângulo do alvo: {math.degrees(erro_rumo):.1f}°   ")
             sys.stdout.flush()
             continue 
 
-        # Detecção de obstáculo à frente
-        bloqueio_frontal = (dist_sensores['SENSOR_MEIO'] < 0.55 or 
-                            (dist_sensores['SENSOR_DIAG_ESQUERDO'] < 0.42 and erro_rumo > 0) or 
-                            (dist_sensores['SENSOR_DIAG_DIREITO'] < 0.42 and erro_rumo < 0))
+        # Zoneamento preventivo de colisões
+        limite_critico = 0.50  
+        limite_frontal = 0.65  
 
-        # Máquina de estados Bug-2
+        bloqueio_frontal = (dist_sensores['SENSOR_MEIO'] < limite_frontal or 
+                            (dist_sensores['SENSOR_DIAG_ESQUERDO'] < limite_critico and erro_rumo > 0) or 
+                            (dist_sensores['SENSOR_DIAG_DIREITO'] < limite_critico and erro_rumo < 0))
+
+        # Máquina de estados Bug-2 tradicional
         if not modo_contorno:
             if bloqueio_frontal:
                 modo_contorno = True
@@ -131,33 +134,33 @@ def main():
             alvo_dwa_x = x_atual + 0.35 * math.cos(angulo_parede)
             alvo_dwa_y = y_atual + 0.35 * math.sin(angulo_parede)
 
-        # ─── INTERCEPTOR MANUAL DE GIRO PURO (SUBSTITUIÇÃO TOTAL DO DWA EM CRISES) ───
-        limite_critico = 0.38
-        
-        # Se os sensores indicarem que bateu de frente ou a quina está muito perto, 
-        # ignoramos completamente o DWA para eliminar qualquer tentativa matemática de recuar.
-        if dist_sensores['SENSOR_MEIO'] < limite_critico or dist_sensores['SENSOR_DIAG_ESQUERDO'] < (limite_critico - 0.05) or dist_sensores['SENSOR_DIAG_DIREITO'] < (limite_critico - 0.05):
+        # Flag de interceptação manual
+        bloqueio_ativo = False
+
+        # ─── INTERCEPTOR MANUAL DE MANOBRA EM PIVÔ FRENTE ───
+        if dist_sensores['SENSOR_MEIO'] < limite_frontal or dist_sensores['SENSOR_DIAG_ESQUERDO'] < limite_critico or dist_sensores['SENSOR_DIAG_DIREITO'] < limite_critico:
             
-            # Escolhe para onde girar baseado no lado livre dos sensores
+            bloqueio_ativo = True
             sentido_giro = calcular_melhor_direcao_escape(dist_sensores)
             
-            # Em vez de enviar (v, w) pro DWA decodificar, injetamos diretamente um giro simétrico perfeito
-            # 1.2 rad/s positivo ou negativo força rotação pura sobre o próprio centro geométrico do robô.
-            melhor_v = 0.0
-            melhor_w = 1.3 * sentido_giro
+            # Definimos v_linear baixa e w_angular alta. Juntando com a trava nas rodas, 
+            # a roda de dentro para e a de fora empurra o robô para a frente e para o lado.
+            melhor_v = 0.02  
+            melhor_w = 1.6 * sentido_giro  
             
-            sys.stdout.write(f"\r[GIRO NO EIXO] Quina ativa! Ajustando angulação parado no lugar... ")
+            sys.stdout.write(f"\r[CRÍTICO] Pivotando para frente/lateral. Lado livre: {sentido_giro} ")
         else:
-            # Caminho livre à frente: o DWA assume o controle normal para navegar
+            # Caminho livre à frente: DWA gerencia as velocidades fluidas
             melhor_v, melhor_w = dwa.planejar(x_atual, y_atual, yaw_atual, alvo_dwa_x, alvo_dwa_y, obstaculos_mapeados)
 
-        # ─── TRAVA DE SEGURANÇA CONTRA QUALQUER VELOCIDADE NEGATIVA RESIDUAL ───
+        # ─── SEGUNDA TRAVA DE SEGURANÇA ANTIDRIVETRAIN INVERSO ───
         if melhor_v < 0.0:
-            melhor_v = 0.0
-            melhor_w = 1.3 * lado_contorno
+            melhor_v = 0.02
+            melhor_w = 1.4 * lado_contorno
+            bloqueio_ativo = True
 
-        # Executa o comando de movimento limpo
-        robo.mover(melhor_v, melhor_w)
+        # Envia comandos de movimentação injetando a flag anti-ré ativa em momentos de crise
+        robo.mover(melhor_v, melhor_w, forçar_avanco=bloqueio_ativo)
         sys.stdout.flush()
 
 if __name__ == '__main__':
