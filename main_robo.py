@@ -19,14 +19,22 @@ class ImprovedAStarPlanner:
         self.grid_map = np.zeros((resolution, resolution), dtype=np.uint8)
 
     def world_to_grid(self, pos):
+        """
+        CONVERSÃO MATEMÁTICA CARTESIANA DIRETA:
+        Como o Matplotlib está usando origin='lower', a coordenada cartesianas do mundo
+        se mapeia diretamente no grid de pixels sem nenhuma inversão manual (255 - valor).
+        """
         offset = self.world_size / 2.0
+        
+        # Converte a escala linear de metros para pixels
         col = int((pos[0] + offset) * self.scale)
         lin = int((pos[1] + offset) * self.scale)
         
-        col = (self.resolution - 1) - col
-        lin = (self.resolution - 1) - lin
-        
-        return max(0, min(self.resolution - 1, col)), max(0, min(self.resolution - 1, lin))
+        # Garante o respeito estrito aos limites da matriz (0 a 255)
+        return (
+            max(0, min(self.resolution - 1, col)),
+            max(0, min(self.resolution - 1, lin))
+        )
 
     def find_nearest_free_node(self, node):
         x, y = node
@@ -243,7 +251,7 @@ def main():
 
         depth_matrix = depth_data.reshape(res_y, res_x)
         
-        depth_matrix = depth_matrix.T
+        # Correção da inversão: rebate verticalmente e espelha horizontalmente (Left-Right)
         depth_matrix = np.flipud(depth_matrix)
         depth_matrix = np.fliplr(depth_matrix)
         
@@ -255,11 +263,19 @@ def main():
         print(f"[ERRO PROCESSAMENTO MAPA]: {erro_mapa}")
         return
 
-    start_grid = planner.world_to_grid([pos_robo[0], pos_robo[1]])
-    goal_grid = planner.world_to_grid([pos_alvo[0], pos_alvo[1]])
+    # --- MAPEAMENTO CARTESIANO DIRETO ---
+    start_dbg = planner.world_to_grid([pos_robo[0], pos_robo[1]])
+    goal_dbg = planner.world_to_grid([pos_alvo[0], pos_alvo[1]])
 
-    start_grid = planner.find_nearest_free_node(start_grid)
-    goal_grid = planner.find_nearest_free_node(goal_grid)
+    print("\n--- REFERENCIAL VALIDADO ---")
+    print("ROBO WORLD :", [round(v,3) for v in pos_robo[:2]])
+    print("ALVO WORLD :", [round(v,3) for v in pos_alvo[:2]])
+    print("ROBO GRID  :", start_dbg)
+    print("ALVO GRID  :", goal_dbg)
+    print("----------------------------")
+
+    start_grid = planner.find_nearest_free_node(start_dbg)
+    goal_grid = planner.find_nearest_free_node(goal_dbg)
 
     planner.grid_map[start_grid[1], start_grid[0]] = 0
     planner.grid_map[goal_grid[1], goal_grid[0]] = 0
@@ -272,7 +288,7 @@ def main():
         print("-> Fluxo A* concluído com sucesso. Gerando amostragem...")
 
         fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-        fig.suptitle("Análise Categórica - Comparativo de Algoritmos (Pontos do A* Tradicional)", fontsize=13, fontweight='bold')
+        fig.suptitle("Análise Categórica - Comparativo de Algoritmos (Sincronização Corrigida)", fontsize=13, fontweight='bold')
 
         # CENA 1: Captura Limpa
         axes[0].imshow(planner.grid_map, cmap='gray_r', origin='lower')
@@ -281,10 +297,9 @@ def main():
         axes[0].set_title("1. Scene Environment Map (Capturado)")
         axes[0].legend()
 
-        # CENA 2: A* Tradicional Renderizado por Pontos Discretos
+        # CENA 2: A* Tradicional por Pontos Discretos
         axes[1].imshow(planner.grid_map, cmap='gray_r', origin='lower')
         rx, ry = zip(*raw_path)
-        # MODIFICAÇÃO AQUI: Trocado 'b-' por 'b.' para desenhar pontos isolados em vez de linha
         axes[1].plot(rx, ry, 'b.', markersize=4, label='Nós do A* Tradicional')
         axes[1].plot(start_grid[0], start_grid[1], 'go', markersize=8)
         axes[1].plot(goal_grid[0], goal_grid[1], 'ro', markersize=8)
@@ -293,8 +308,7 @@ def main():
 
         # CENA 3: A* Modificado Otimizado
         axes[2].imshow(planner.grid_map, cmap='gray_r', origin='lower')
-        # MODIFICAÇÃO AQUI: Pano de fundo do A* tradicional também alterado para pontos ('b.')
-        axes[2].plot(rx, ry, 'b.', markersize=2, alpha=0.5, label='A* Tradicional')
+        axes[2].plot(rx, ry, 'b.', markersize=2, alpha=0.5, label='A* Original')
         
         # Plota os Key Points (X amarelos)
         kx, ky = zip(*key_points)
