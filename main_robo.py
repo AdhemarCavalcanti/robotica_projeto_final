@@ -1,333 +1,404 @@
-import sys
 import math
-import heapq
 import numpy as np
 import matplotlib.pyplot as plt
-import time
+import threading
 
-try:
-    from coppeliasim_zmqremoteapi_client import RemoteAPIClient # type: ignore
-except ImportError:
-    print("\n[ERRO]: Não foi possível encontrar 'coppeliasim_zmqremoteapi_client'.")
-    sys.exit(1)
+from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+import dwa_navigation as dw
+import mapa_ocupacao as mo
 
-class ImprovedAStarPlanner:
-    def __init__(self, resolution=256, world_size=5.0):
-        self.resolution = resolution
-        self.world_size = world_size
-        self.scale = resolution / world_size
-        self.grid_map = np.zeros((resolution, resolution), dtype=np.uint8)
+SINAL_FWD = +1
 
-    def world_to_grid(self, pos):
-        """
-        CONVERSÃO MATEMÁTICA CARTESIANA DIRETA:
-        Como o Matplotlib está usando origin='lower', a coordenada cartesianas do mundo
-        se mapeia diretamente no grid de pixels sem nenhuma inversão manual (255 - valor).
-        """
-        offset = self.world_size / 2.0
-        
-        # Converte a escala linear de metros para pixels
-        col = int((pos[0] + offset) * self.scale)
-        lin = int((pos[1] + offset) * self.scale)
-        
-        # Garante o respeito estrito aos limites da matriz (0 a 255)
-        return (
-            max(0, min(self.resolution - 1, col)),
-            max(0, min(self.resolution - 1, lin))
+client = RemoteAPIClient()
+sim = client.require("sim")
+
+ctx = {}
+dwa = dw.DWAController()
+
+
+def norm_ang(ang):
+    return math.atan2(math.sin(ang), math.cos(ang))
+
+
+def get_obj(path):
+    try:
+        return sim.getObject(path)
+    except Exception as err:
+        raise RuntimeError(f"Objeto ausente: {path}") from err
+
+
+def is_child(h, parent):
+    curr = h
+    while curr != -1:
+        if curr == parent:
+            return True
+        curr = sim.getObjectParent(curr)
+    return False
+
+
+def trans_pt(mat, pt):
+    return np.array(
+        [
+            mat[0] * pt[0] + mat[1] * pt[1] + mat[2] * pt[2] + mat[3],
+            mat[4] * pt[0] + mat[5] * pt[1] + mat[6] * pt[2] + mat[7],
+            mat[8] * pt[0] + mat[9] * pt[1] + mat[10] * pt[2] + mat[11],
+        ],
+        dtype=float,
+    )
+
+
+def add_rect_pts(pts, x0, x1, y0, y1, step=0.06):
+    x = x0
+    while x <= x1:
+        pts.append([x, y0])
+        pts.append([x, y1])
+        x += step
+
+    y = y0
+    while y <= y1:
+        pts.append([x0, y])
+        pts.append([x1, y])
+        y += step
+
+
+def fill_rot_rect(pts, mat, x0, x1, y0, y1, step=0.04):
+    x = x0
+    while x <= x1:
+        y = y0
+        while y <= y1:
+            w_pt = trans_pt(mat, [x, y, 0.0])
+            pts.append([w_pt[0], w_pt[1]])
+            y += step
+        x += step
+
+
+def get_static_obs():
+    pts = []
+    floor = get_obj("/Floor")
+    f_pos = sim.getObjectPosition(floor, -1)
+
+    f_x0 = sim.getObjectFloatParam(floor, sim.objfloatparam_objbbox_min_x)
+    f_x1 = sim.getObjectFloatParam(floor, sim.objfloatparam_objbbox_max_x)
+    f_y0 = sim.getObjectFloatParam(floor, sim.objfloatparam_objbbox_min_y)
+    f_y1 = sim.getObjectFloatParam(floor, sim.objfloatparam_objbbox_max_y)
+
+    add_rect_pts(pts, f_pos[0] + f_x0, f_pos[0] + f_x1, f_pos[1] + f_y0, f_pos[1] + f_y1)
+
+    for obj in sim.getObjectsInTree(sim.handle_scene):
+        if sim.getObjectType(obj) != sim.object_shape_type:
+            continue
+
+        alias = sim.getObjectAlias(obj, 0)
+        if alias in {"Floor", "box", "Goal", "Target", "Alvo", "camera_grade_ocupacao"}:
+            continue
+
+        if obj == ctx["rb"] or is_child(obj, ctx["rb"]):
+            continue
+
+        mat = sim.getObjectMatrix(obj, -1)
+        x0 = sim.getObjectFloatParam(obj, sim.objfloatparam_objbbox_min_x)
+        x1 = sim.getObjectFloatParam(obj, sim.objfloatparam_objbbox_max_x)
+        y0 = sim.getObjectFloatParam(obj, sim.objfloatparam_objbbox_min_y)
+        y1 = sim.getObjectFloatParam(obj, sim.objfloatparam_objbbox_max_y)
+
+        if (x1 - x0) > 4.5 or (y1 - y0) > 4.5:
+            continue
+
+        fill_rot_rect(pts, mat, x0, x1, y0, y1)
+
+    uniq = {(round(x, 2), round(y, 2)): [x, y] for x, y in pts}
+    return np.array(list(uniq.values()), dtype=float)
+
+
+def get_rb_state(v=0.0, w=0.0):
+    pos = sim.getObjectPosition(ctx["rb"], -1)
+    ori = sim.getObjectOrientation(ctx["rb"], -1)
+    offset = ctx.get("h_off", 0.0)
+    flip = 0.0 if SINAL_FWD >= 0 else math.pi
+    th = norm_ang(ori[2] + offset + flip)
+    return np.array([pos[0], pos[1], th, v, w], dtype=float)
+
+
+def calc_h_offset():
+    s_front = ctx["ss"][0]
+    mat = sim.getObjectMatrix(s_front, -1)
+    yaw_f = math.atan2(mat[6], mat[2])
+    yaw_m = sim.getObjectOrientation(ctx["rb"], -1)[2]
+    ctx["h_off"] = norm_ang(yaw_f - yaw_m)
+    print("Offset (graus):", round(math.degrees(ctx["h_off"]), 1))
+
+
+def get_sensor_obs():
+    obs = []
+    for s in ctx["ss"]:
+        res, dist, pt, _, _ = sim.readProximitySensor(s)
+        if res > 0:
+            d_pt = np.array(pt, dtype=float)
+            if np.linalg.norm(d_pt) <= 0.0 and dist > 0.0:
+                d_pt = np.array([dist, 0.0, 0.0], dtype=float)
+            mat = sim.getObjectMatrix(s, -1)
+            w_obs = trans_pt(mat, d_pt)
+            obs.append([w_obs[0], w_obs[1]])
+    return np.array(obs, dtype=float)
+
+
+def get_all_obs(x):
+    local_obs = []
+    st_obs = ctx.get("st_obs")
+    if st_obs is not None and len(st_obs) > 0:
+        dists = np.hypot(st_obs[:, 0] - x[0], st_obs[:, 1] - x[1])
+        local_obs.extend(st_obs[dists <= 1.4].tolist())
+
+    s_obs = get_sensor_obs()
+    if len(s_obs) > 0:
+        local_obs.extend(s_obs.tolist())
+    return np.array(local_obs, dtype=float)
+
+
+def check_collision(x):
+    st_obs = ctx.get("st_obs")
+    if st_obs is None or len(st_obs) == 0:
+        return False
+    dists = np.hypot(st_obs[:, 0] - x[0], st_obs[:, 1] - x[1])
+    return float(np.min(dists)) <= dwa.collision_radius
+
+
+def plan_global():
+    obs = ctx["st_obs"]
+    sx, sy = float(ctx["x"][0]), float(ctx["x"][1])
+    gx, gy = float(ctx["goal_xy"][0]), float(ctx["goal_xy"][1])
+    rx = ry = kx = ky = None
+
+    for rr in (0.22, 0.18, 0.14):
+        planner = dw.AStarPlanner(obs[:, 0].tolist(), obs[:, 1].tolist(), resolution=0.08, rr=rr)
+        rx, ry, kx, ky = planner.planning(sx, sy, gx, gy)
+        if not planner.last_plan_failed:
+            print(f"A* OK com rr={rr:.2f}")
+            break
+        print(f"A* falhou com rr={rr:.2f}")
+    else:
+        print("A* falhou geral, linha reta.")
+        rx, ry, kx, ky = [sx, gx], [sy, gy], [sx, gx], [sy, gy]
+
+    ctx["g_path"] = list(zip(rx, ry))
+    ctx["k_pts"] = list(zip(kx, ky))
+    ctx["p_idx"] = 0
+
+
+def get_target(x):
+    path = ctx.get("g_path", [ctx["goal_xy"]])
+    while ctx["p_idx"] < len(path) - 1:
+        t = path[ctx["p_idx"]]
+        if math.hypot(t[0] - x[0], t[1] - x[1]) >= 0.40:
+            break
+        ctx["p_idx"] += 1
+    idx = min(ctx["p_idx"] + 2, len(path) - 1)
+    return path[idx]
+
+
+def move_robot(u):
+    v, w = float(u[0]), float(u[1])
+    dt = dwa.dt
+    r_w, base = 0.0375, 0.15
+
+    x = ctx["x"].copy()
+    x[2] = norm_ang(x[2] + w * dt)
+    x[0] += v * math.cos(x[2]) * dt
+    x[1] += v * math.sin(x[2]) * dt
+    x[3], x[4] = v, w
+
+    if check_collision(x):
+        x = ctx["x"].copy()
+        x[2] = norm_ang(x[2] + w * dt)
+        x[3], x[4] = 0.0, w
+        v = 0.0
+
+    v_f, w_f = -v, -w
+    wr = (2.0 * v_f + w_f * base) / (2.0 * r_w)
+    wl = (2.0 * v_f - w_f * base) / (2.0 * r_w)
+    wr = max(min(wr, 20.0), -20.0)
+    wl = max(min(wl, 20.0), -20.0)
+
+    sim.setJointTargetVelocity(ctx["m_r"], wr)
+    sim.setJointTargetVelocity(ctx["m_l"], wl)
+    sim.setObjectPosition(ctx["rb"], -1, [x[0], x[1], ctx["rb_z"]])
+
+    offset = ctx.get("h_off", 0.0)
+    flip = 0.0 if SINAL_FWD >= 0 else math.pi
+    yaw_m = norm_ang(x[2] - offset - flip)
+
+    sim.setObjectOrientation(ctx["rb"], -1, [ctx["rb_r"], ctx["rb_p"], yaw_m])
+    try:
+        sim.resetDynamicObject(ctx["rb"])
+    except Exception:
+        pass
+
+    sim.step()
+    return x
+
+
+def fetch_static_obs():
+    skip = [
+        (float(ctx["x"][0]), float(ctx["x"][1]), dwa.robot_radius + 0.15),
+        (float(ctx["goal_xy"][0]), float(ctx["goal_xy"][1]), dwa.robot_radius + 0.10),
+    ]
+    try:
+        floor = get_obj("/Floor")
+        pts, grid, inf = mo.construir_obstaculos_por_visao(sim, floor, excluir=skip)
+        ctx["grid"], ctx["grid_inf"] = grid, inf
+        if len(pts) >= 4:
+            return pts
+    except Exception:
+        print("Usando fallback Bounding Box...")
+    return get_static_obs()
+
+
+def _thread_map(x0, x1, y0, y1, obs, path, k_pts, rx, ry, gx, gy):
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 5))
+    fig.suptitle("Planejamento Estático - A*", fontsize=12, fontweight='bold')
+
+    for ax, t in zip([ax1, ax2], ["Rota Completa", "Pontos-Chave"]):
+        ax.set_title(t)
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.grid(True)
+        ax.axis("equal")
+        ax.set_xlim(x0 - 0.1, x1 + 0.1)
+        ax.set_ylim(y0 - 0.1, y1 + 0.1)
+        if len(obs) > 0:
+            ax.scatter(obs[:, 0], obs[:, 1], s=4, c="black", marker="s")
+        ax.plot(rx, ry, "go", markersize=9)
+        ax.plot(gx, gy, "ro", markersize=9)
+
+    if len(path) > 0:
+        ax1.plot(path[:, 0], path[:, 1], "b-", linewidth=2)
+    if len(k_pts) > 0:
+        ax2.plot(k_pts[:, 0], k_pts[:, 1], "y-x", markersize=8, linewidth=1.5)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def run_map_thread():
+    floor = get_obj("/Floor")
+    f_pos = sim.getObjectPosition(floor, -1)
+    x0 = f_pos[0] + sim.getObjectFloatParam(floor, sim.objfloatparam_objbbox_min_x)
+    x1 = f_pos[0] + sim.getObjectFloatParam(floor, sim.objfloatparam_objbbox_max_x)
+    y0 = f_pos[1] + sim.getObjectFloatParam(floor, sim.objfloatparam_objbbox_min_y)
+    y1 = f_pos[1] + sim.getObjectFloatParam(floor, sim.objfloatparam_objbbox_max_y)
+
+    t = threading.Thread(
+        target=_thread_map,
+        args=(
+            x0, x1, y0, y1,
+            np.array(ctx.get("st_obs", [])),
+            np.array(ctx.get("g_path", [])),
+            np.array(ctx.get("k_pts", [])),
+            ctx["x"][0], ctx["x"][1],
+            ctx["goal_xy"][0], ctx["goal_xy"][1]
         )
-
-    def find_nearest_free_node(self, node):
-        x, y = node
-        if self.grid_map[y, x] != 255:
-            return node
-            
-        queue = [(x, y)]
-        visited = {(x, y)}
-        
-        while queue:
-            cx, cy = queue.pop(0)
-            if self.grid_map[cy, cx] != 255:
-                return (cx, cy)
-                
-            for dx, dy in [(0,1), (0,-1), (1,0), (-1,0), (1,1), (1,-1), (-1,1), (-1,-1)]:
-                nx, ny = cx + dx, cy + dy
-                if 0 <= nx < self.resolution and 0 <= ny < self.resolution:
-                    if (nx, ny) not in visited:
-                        visited.add((nx, ny))
-                        queue.append((nx, ny))
-        return node
-
-    def _euclidean_distance(self, p1, p2):
-        return math.hypot(p2[0] - p1[0], p2[1] - p1[1])
-
-    def _get_neighbors(self, node):
-        x, y = node
-        neighbors = []
-        directions = [
-            (0, 1, 1.0), (0, -1, 1.0), (1, 0, 1.0), (-1, 0, 1.0),
-            (1, 1, math.sqrt(2)), (1, -1, math.sqrt(2)),
-            (-1, 1, math.sqrt(2)), (-1, -1, math.sqrt(2))
-        ]
-        for dx, dy, cost in directions:
-            nx, ny = x + dx, y + dy
-            if 0 <= nx < self.resolution and 0 <= ny < self.resolution:
-                if self.grid_map[ny, nx] != 255: 
-                    neighbors.append(((nx, ny), cost))
-        return neighbors
-
-    def has_line_of_sight(self, p1, p2):
-        x1, y1 = p1
-        x2, y2 = p2
-        dx, dy = abs(x2 - x1), abs(y2 - y1)
-        sx = 1 if x1 < x2 else -1
-        sy = 1 if y1 < y2 else -1
-        err = dx - dy
-        cx, cy = x1, y1
-        while (cx, cy) != (x2, y2):
-            if self.grid_map[cy, cx] == 255:
-                return False
-            e2 = 2 * err
-            if e2 > -dy:
-                err -= dy
-                cx += sx
-            if e2 < dx:
-                err += dx
-                cy += sy
-        return self.grid_map[y2, x2] != 255
-
-    def find_path(self, start, goal):
-        D = self._euclidean_distance(start, goal)
-        open_list = []
-        heapq.heappush(open_list, (0.0, 0, start))
-        
-        g_score = {start: 0.0}
-        came_from = {start: None}
-        closed_set = set()
-        counter = 0
-
-        print(f"-> [A*] Executando busca de {start} até {goal}...")
-        while open_list:
-            _, _, current = heapq.heappop(open_list)
-            
-            if current == goal:
-                print("-> [A*] Alvo alcançado! Gerando caminho bruto...")
-                path = []
-                while current is not None:
-                    path.append(current)
-                    current = came_from[current]
-                return path[::-1]
-
-            closed_set.add(current)
-
-            for neighbor, move_cost in self._get_neighbors(current):
-                if neighbor in closed_set:
-                    continue
-                
-                tentative_g = g_score[current] + move_cost
-                
-                if neighbor not in g_score or tentative_g < g_score[neighbor]:
-                    g_score[neighbor] = tentative_g
-                    
-                    d = self._euclidean_distance(neighbor, goal)
-                    omega = 1.0 + (d / D) if D > 0 else 1.0
-                    f = tentative_g + (omega * d)
-                    
-                    came_from[neighbor] = current
-                    counter += 1
-                    heapq.heappush(open_list, (f, counter, neighbor))
-                    
-        raise RuntimeError("Não foi possível encontrar um caminho válido.")
-
-    def remove_redundant_nodes(self, raw_path):
-        if len(raw_path) <= 2:
-            return raw_path
-            
-        colinear = [raw_path[0]]
-        for i in range(1, len(raw_path) - 1):
-            x1, y1 = raw_path[i-1]
-            x2, y2 = raw_path[i]
-            x3, y3 = raw_path[i+1]
-            if (y2 - y1) * (x3 - x2) != (y3 - y2) * (x2 - x1):
-                colinear.append(raw_path[i])
-        colinear.append(raw_path[-1])
-
-        key_points = [colinear[0]]
-        curr = 0
-        while curr < len(colinear) - 1:
-            next_p = curr + 1
-            for j in range(len(colinear) - 1, curr, -1):
-                if self.has_line_of_sight(colinear[curr], colinear[j]):
-                    next_p = j
-                    break
-            key_points.append(colinear[next_p])
-            curr = next_p
-        return key_points
-
-    def bessel_smoothing(self, key_points, num_points=15):
-        if len(key_points) < 2:
-            return key_points
-            
-        smoothed = []
-        for idx in range(len(key_points) - 1):
-            p_start = np.array(key_points[idx])
-            p_end = np.array(key_points[idx+1])
-            
-            for step in range(num_points):
-                t = step / (num_points - 1)
-                p_t = (1 - t) * p_start + t * p_end
-                
-                if step == 0 and len(smoothed) > 0:
-                    continue
-                smoothed.append((float(p_t[0]), float(p_t[1])))
-                
-        return smoothed
+    )
+    t.daemon = True
+    t.start()
 
 
-def main():
-    print("Conectando ao CoppeliaSim via API Remota...")
-    try:
-        client = RemoteAPIClient()
-        sim = client.getObject('sim')
-        
-        sensor_handle = sim.getObject('/SENSOR_MAPEAMENTO') 
-        cuboid_handle = sim.getObject('/Cuboid')
-        alvo_handle = sim.getObject('/Alvo')
+def init():
+    ctx["m_r"] = get_obj("/MOTOR_DIREITO")
+    ctx["m_l"] = get_obj("/MOTOR_ESQUERDO")
+    ctx["rb"] = sim.getObjectParent(ctx["m_r"])
+    ctx["gl"] = get_obj("/Alvo")
 
-        print("\n--- CAPTURANDO SCENE ENVIRONMENT MAP ---")
-        planner = ImprovedAStarPlanner(resolution=256, world_size=5.0)
-        
-        sim.stopSimulation()
-        while sim.getSimulationState() != sim.simulation_stopped:
-            time.sleep(0.05)
-            
-        client.setStepping(True)
-        sim.startSimulation()
-        
-        for _ in range(15):
-            client.step()
-            time.sleep(0.02)
+    ctx["ss"] = [
+        get_obj("/SENSOR_MEIO"),
+        get_obj("/SENSOR_DIAG_DIREITO"),
+        get_obj("/SENSOR_DIAG_ESQUERDO"),
+        get_obj("/SENSOR_DIREITO"),
+        get_obj("/SENSOR_ESQUERDO"),
+    ]
 
-        retorno_bruto = sim.getVisionSensorDepthBuffer(sensor_handle)
-        pos_robo = sim.getObjectPosition(cuboid_handle, -1)
-        pos_alvo = sim.getObjectPosition(alvo_handle, -1)
-        
-        client.setStepping(False)
-        sim.stopSimulation()
+    r_pos = sim.getObjectPosition(ctx["rb"], -1)
+    r_ori = sim.getObjectOrientation(ctx["rb"], -1)
+    ctx["rb_z"], ctx["rb_r"], ctx["rb_p"] = r_pos[2], r_ori[0], r_ori[1]
 
-    except Exception as e:
-        print(f"[ERRO DE CONEXÃO/API]: {e}")
-        sys.exit(1)
+    calc_h_offset()
+    ctx["x"] = get_rb_state()
 
-    # --- PROCESSAMENTO DO BUFFER ---
-    try:
-        depth_buffer = None
-        res_x, res_y = 256, 256 
+    g_pos = sim.getObjectPosition(ctx["gl"], -1)
+    ctx["goal_xy"] = [g_pos[0], g_pos[1]]
+    ctx["st_obs"] = fetch_static_obs()
+    ctx["steps"] = 0
 
-        if isinstance(retorno_bruto, (list, tuple)):
-            if len(retorno_bruto) > 0 and isinstance(retorno_bruto[0], (int, float)):
-                depth_buffer = retorno_bruto
-            else:
-                for item in retorno_bruto:
-                    if isinstance(item, dict):
-                        depth_buffer = item.get('buffer', item.get('image', None))
-                        res_x, res_y = item.get('resolution', [256, 256])
-                        break
-                    elif isinstance(item, (bytes, bytearray, list)):
-                        depth_buffer = item
-        elif isinstance(retorno_bruto, dict):
-            depth_buffer = retorno_bruto.get('buffer', retorno_bruto.get('image', None))
-            res_x, res_y = retorno_bruto.get('resolution', [256, 256])
-        else:
-            depth_buffer = retorno_bruto
+    plan_global()
+    run_map_thread()
 
-        if depth_buffer is None:
-            print("[ERRO]: Buffer de imagem nulo.")
-            return
 
-        depth_data = np.array(depth_buffer, dtype=np.float32).flatten()
-        if depth_data.size != (res_x * res_y):
-            lado = int(np.sqrt(depth_data.size))
-            if lado * lado == depth_data.size: res_x, res_y = lado, lado
+def replan():
+    plan_global()
 
-        depth_matrix = depth_data.reshape(res_y, res_x)
-        
-        # Correção da inversão: rebate verticalmente e espelha horizontalmente (Left-Right)
-        depth_matrix = np.flipud(depth_matrix)
-        depth_matrix = np.fliplr(depth_matrix)
-        
-        valor_chao = np.max(depth_matrix)
-        planner.grid_map = np.where(depth_matrix < (valor_chao - 0.015), 255, 0).astype(np.uint8)
-        print(f"-> Mapa alinhado com sucesso. Resolução: {res_x}x{res_y}")
 
-    except Exception as erro_mapa:
-        print(f"[ERRO PROCESSAMENTO MAPA]: {erro_mapa}")
-        return
+def recovery_cmd(x, t):
+    ang = math.atan2(t[1] - x[1], t[0] - x[0])
+    turn = norm_ang(ang - x[2])
+    w = max(min(1.2 * turn, dwa.max_yaw_rate), -dwa.max_yaw_rate)
+    fase = ctx.get("_rec", 0)
 
-    # --- MAPEAMENTO CARTESIANO DIRETO ---
-    start_dbg = planner.world_to_grid([pos_robo[0], pos_robo[1]])
-    goal_dbg = planner.world_to_grid([pos_alvo[0], pos_alvo[1]])
+    if fase > 22:
+        return [0.07, 0.3 * w]
+    if abs(turn) > 0.25:
+        return [0.0, -0.8 if turn >= 0.0 else 0.8]
+    return [-0.10, 0.5 * w]
 
-    print("\n--- REFERENCIAL VALIDADO ---")
-    print("ROBO WORLD :", [round(v,3) for v in pos_robo[:2]])
-    print("ALVO WORLD :", [round(v,3) for v in pos_alvo[:2]])
-    print("ROBO GRID  :", start_dbg)
-    print("ALVO GRID  :", goal_dbg)
-    print("----------------------------")
 
-    start_grid = planner.find_nearest_free_node(start_dbg)
-    goal_grid = planner.find_nearest_free_node(goal_dbg)
+def loop():
+    if ctx["gl"] is not None:
+        g_pos = sim.getObjectPosition(ctx["gl"], -1)
+        ctx["goal_xy"] = [g_pos[0], g_pos[1]]
 
-    planner.grid_map[start_grid[1], start_grid[0]] = 0
-    planner.grid_map[goal_grid[1], goal_grid[0]] = 0
+    x = ctx["x"]
+    obs = get_all_obs(x)
+    tgt = get_target(x)
 
-    # --- EXECUÇÃO E EXIBIÇÃO ---
-    try:
-        raw_path = planner.find_path(start_grid, goal_grid)
-        key_points = planner.remove_redundant_nodes(raw_path)
-        optimal_path = planner.bessel_smoothing(key_points)
-        print("-> Fluxo A* concluído com sucesso. Gerando amostragem...")
+    ref = ctx.get("_stk_ref")
+    if ref is None or math.hypot(x[0] - ref[0], x[1] - ref[1]) > 0.05:
+        ctx["_stk_ref"] = (float(x[0]), float(x[1]))
+        ctx["_stk_steps"] = 0
+    else:
+        ctx["_stk_steps"] = ctx.get("_stk_steps", 0) + 1
 
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-        fig.suptitle("Análise Categórica - Comparativo de Algoritmos (Sincronização Corrigida)", fontsize=13, fontweight='bold')
+    if ctx.get("_rec", 0) > 0:
+        u = recovery_cmd(x, tgt)
+        ctx["_rec"] -= 1
+    else:
+        u, _ = dwa.plan(x[0:3], x[3], x[4], tgt, obs)
+        if ctx.get("_stk_steps", 0) >= 30:
+            print("Preso -> replanejando...")
+            replan()
+            ctx["_rec"] = 35
+            ctx["_stk_steps"] = 0
 
-        # CENA 1: Captura Limpa
-        axes[0].imshow(planner.grid_map, cmap='gray_r', origin='lower')
-        axes[0].plot(start_grid[0], start_grid[1], 'go', markersize=10, label='Start (Robô)')
-        axes[0].plot(goal_grid[0], goal_grid[1], 'ro', markersize=10, label='Target (Alvo)')
-        axes[0].set_title("1. Scene Environment Map (Capturado)")
-        axes[0].legend()
+    ctx["x"] = move_robot(u)
+    ctx["steps"] += 1
 
-        # CENA 2: A* Tradicional por Pontos Discretos
-        axes[1].imshow(planner.grid_map, cmap='gray_r', origin='lower')
-        rx, ry = zip(*raw_path)
-        axes[1].plot(rx, ry, 'b.', markersize=4, label='Nós do A* Tradicional')
-        axes[1].plot(start_grid[0], start_grid[1], 'go', markersize=8)
-        axes[1].plot(goal_grid[0], goal_grid[1], 'ro', markersize=8)
-        axes[1].set_title("2. A* Tradicional (Nós Explorados)")
-        axes[1].legend()
+    if math.hypot(ctx["x"][0] - ctx["goal_xy"][0], ctx["x"][1] - ctx["goal_xy"][1]) <= 0.20:
+        print("ALVO ATINGIDO!")
+        return True
+    return False
 
-        # CENA 3: A* Modificado Otimizado
-        axes[2].imshow(planner.grid_map, cmap='gray_r', origin='lower')
-        axes[2].plot(rx, ry, 'b.', markersize=2, alpha=0.5, label='A* Original')
-        
-        # Plota os Key Points (X amarelos)
-        kx, ky = zip(*key_points)
-        axes[2].plot(kx, ky, 'yX', markersize=9, zorder=5, label='Key Points Assinalados')
-        
-        # Plota a Trajetória Otimizada (Linha contínua rosa cruzando os Key Points)
-        ox, oy = zip(*optimal_path)
-        axes[2].plot(ox, oy, 'm-', linewidth=3, zorder=4, label='Trajetória Modificada Corrigida')
-        
-        axes[2].plot(start_grid[0], start_grid[1], 'go', markersize=8)
-        axes[2].plot(goal_grid[0], goal_grid[1], 'ro', markersize=8)
-        axes[2].set_title("3. A* Melhorado (Vínculo aos Pontos-Chave)")
-        axes[2].legend()
-
-        plt.tight_layout()
-        plt.show()
-
-    except Exception as erro_loop:
-        print(f"\n[FALHA NO LOOP DE BUSCA]: {erro_loop}")
 
 if __name__ == "__main__":
-    main()
+    print("Iniciando...")
+    sim.setStepping(True)
+    sim.startSimulation()
+
+    try:
+        init()
+        while not loop():
+            pass
+    except KeyboardInterrupt:
+        print("Interrompido.")
+    finally:
+        if "m_r" in ctx and "m_l" in ctx:
+            sim.setJointTargetVelocity(ctx["m_r"], 0.0)
+            sim.setJointTargetVelocity(ctx["m_l"], 0.0)
+        sim.stopSimulation()
+        print("Encerrado.")
