@@ -279,7 +279,12 @@ def _thread_map(x0, x1, y0, y1, obs, path, k_pts, rx, ry, gx, gy):
     plt.show()
 
 
-def run_map_thread():
+def exibir_mapa_inicial():
+    # Só tenta gerar o gráfico se as variáveis estáticas foram inicializadas
+    if "st_obs" not in ctx:
+        print("[Aviso] Não foi possível abrir o mapa pois os obstáculos não foram calculados.")
+        return
+
     floor = get_obj("/Floor")
     f_pos = sim.getObjectPosition(floor, -1)
     x0 = f_pos[0] + sim.getObjectFloatParam(floor, sim.objfloatparam_objbbox_min_x)
@@ -287,19 +292,18 @@ def run_map_thread():
     y0 = f_pos[1] + sim.getObjectFloatParam(floor, sim.objfloatparam_objbbox_min_y)
     y1 = f_pos[1] + sim.getObjectFloatParam(floor, sim.objfloatparam_objbbox_max_y)
 
-    t = threading.Thread(
-        target=_thread_map,
-        args=(
-            x0, x1, y0, y1,
-            np.array(ctx.get("st_obs", [])),
-            np.array(ctx.get("g_path", [])),
-            np.array(ctx.get("k_pts", [])),
-            ctx["x"][0], ctx["x"][1],
-            ctx["goal_xy"][0], ctx["goal_xy"][1]
-        )
+    print("\n---> ABRINDO O MAPA INICIAL <---")
+    print("Analise as rotas geradas pelo A*. FECHE A JANELA DO GRÁFICO para iniciar a simulação no CoppeliaSim.\n")
+    
+    # Executa a função diretamente (sem thread) para pausar o código aqui
+    _thread_map(
+        x0, x1, y0, y1,
+        np.array(ctx.get("st_obs", [])),
+        np.array(ctx.get("g_path", [])),
+        np.array(ctx.get("k_pts", [])),
+        ctx["x"][0], ctx["x"][1],
+        ctx["goal_xy"][0], ctx["goal_xy"][1]
     )
-    t.daemon = True
-    t.start()
 
 
 def init():
@@ -328,8 +332,8 @@ def init():
     ctx["st_obs"] = fetch_static_obs()
     ctx["steps"] = 0
 
+    # Calcula a rota global do A*
     plan_global()
-    run_map_thread()
 
 
 def replan():
@@ -386,19 +390,30 @@ def loop():
 
 
 if __name__ == "__main__":
-    print("Iniciando...")
+    print("Conectando ao CoppeliaSim...")
+    
+    # 1. Inicializa as variáveis e calcula a rota estática ANTES de dar Play
+    init()
+    
+    # 2. Mostra o mapa na tela. O código vai travar aqui até você fechar a janela.
+    exibir_mapa_inicial()
+
+    # 3. Assim que você fechar a janela, a simulação REALMENTE começa no CoppeliaSim
+    print("Iniciando a simulação física...")
     sim.setStepping(True)
     sim.startSimulation()
 
     try:
-        init()
         while not loop():
             pass
     except KeyboardInterrupt:
-        print("Interrompido.")
+        print("Interrompido pelo usuário.")
     finally:
+        # Para os motores do robô
         if "m_r" in ctx and "m_l" in ctx:
             sim.setJointTargetVelocity(ctx["m_r"], 0.0)
             sim.setJointTargetVelocity(ctx["m_l"], 0.0)
+        
+        # Para a simulação física
         sim.stopSimulation()
-        print("Encerrado.")
+        print("Simulação encerrada e finalizada.")
