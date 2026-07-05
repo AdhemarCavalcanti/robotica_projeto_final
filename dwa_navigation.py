@@ -7,15 +7,17 @@ def norm_ang(ang):
 
 
 # ==========================================================================
-#  CONTROLADOR LOCAL - DWA
+#  CONTROLADOR LOCAL - DWA (CONFIGURADO PARA MOVIMENTOS MAIS LENTOS)
 # ==========================================================================
 class DWAController:
     def __init__(self):
-        self.max_v = 0.35
+        
+        self.max_v = 0.20          
         self.min_v = 0.0
-        self.max_w = 1.2
-        self.max_dv = 0.7
-        self.max_dw = 2.5
+        self.max_w = 0.70          
+        self.max_dv = 0.4         
+        self.max_dw = 1.5          
+      
 
         self.v_res = 0.02
         self.w_res = 0.08
@@ -26,7 +28,8 @@ class DWAController:
         self.collision_radius = 0.16
         self.margin = 0.06
 
-        self.w_goal = 0.25
+        
+        self.w_goal = 0.40         
         self.w_speed = 1.0
         self.w_obs = 0.45
         self.w_dist = 2.2
