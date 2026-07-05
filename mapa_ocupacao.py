@@ -8,7 +8,7 @@ import numpy as np
 class ConfigGrade:
     nome_sensor = "/camera_grade_ocupacao"
     res = 256
-    altura = 3.0
+    altura = 4.0
     margem = 0.2
     alt_min_obs = 0.05
     flip_x = False
@@ -169,6 +169,7 @@ if __name__ == "__main__":
     sim = client.require("sim")
     cfg = ConfigGrade()
 
+    # RESTAURADO: A simulação agora inicia e para automaticamente no teste isolado
     sim.setStepping(True)
     sim.startSimulation()
     try:
