@@ -2,160 +2,239 @@ import math
 import numpy as np
 
 
-def normalize_angle(angle):
-    """Garante que o ângulo permaneça no intervalo [-pi, pi]."""
-    return math.atan2(math.sin(angle), math.cos(angle))
+def angle_wrap(theta):
+    return math.atan2(math.sin(theta), math.cos(theta))
 
 
-# ==========================================================================
-#  CONTROLADOR LOCAL - DWA (DYNAMIC WINDOW APPROACH)
-# ==========================================================================
+def diff_drive_predict(pose, v, w, dt):
+    nxt = np.array(pose, dtype=float)
+    nxt[2] = angle_wrap(nxt[2] + w * dt)
+    nxt[0] += v * math.cos(nxt[2]) * dt
+    nxt[1] += v * math.sin(nxt[2]) * dt
+    return nxt
+
+
+def bounding_box_to_points(sim, obj_handle, step=0.04):
+    x0 = sim.getObjectFloatParam(obj_handle, sim.objfloatparam_objbbox_min_x)
+    x1 = sim.getObjectFloatParam(obj_handle, sim.objfloatparam_objbbox_max_x)
+    y0 = sim.getObjectFloatParam(obj_handle, sim.objfloatparam_objbbox_min_y)
+    y1 = sim.getObjectFloatParam(obj_handle, sim.objfloatparam_objbbox_max_y)
+    mat = sim.getObjectMatrix(obj_handle, -1)
+
+    pts = []
+    xx = x0
+    while xx <= x1:
+        yy = y0
+        while yy <= y1:
+            p = np.array([xx, yy, 0.0], dtype=float)
+            wp = np.array([
+                mat[0] * p[0] + mat[1] * p[1] + mat[2] * p[2] + mat[3],
+                mat[4] * p[0] + mat[5] * p[1] + mat[6] * p[2] + mat[7],
+                mat[8] * p[0] + mat[9] * p[1] + mat[10] * p[2] + mat[11],
+            ], dtype=float)
+            pts.append([wp[0], wp[1]])
+            yy += step
+        xx += step
+    return pts
+
+
+def rect_outline_points(sim, obj_handle, step=0.06):
+    pos = sim.getObjectPosition(obj_handle, -1)
+    x0 = pos[0] + sim.getObjectFloatParam(obj_handle, sim.objfloatparam_objbbox_min_x)
+    x1 = pos[0] + sim.getObjectFloatParam(obj_handle, sim.objfloatparam_objbbox_max_x)
+    y0 = pos[1] + sim.getObjectFloatParam(obj_handle, sim.objfloatparam_objbbox_min_y)
+    y1 = pos[1] + sim.getObjectFloatParam(obj_handle, sim.objfloatparam_objbbox_max_y)
+
+    pts = []
+    x = x0
+    while x <= x1:
+        pts.append([x, y0])
+        pts.append([x, y1])
+        x += step
+    y = y0
+    while y <= y1:
+        pts.append([x0, y])
+        pts.append([x1, y])
+        y += step
+    return pts
+
+
+def unique_points(points):
+    bucket = {(round(x, 2), round(y, 2)): [x, y] for x, y in points}
+    return np.array(list(bucket.values()), dtype=float)
+
+
+def build_occupancy_from_scene(sim, robot_handle, floor_handle, ignore_aliases, big_limit=4.5):
+    pts = []
+    pts.extend(rect_outline_points(sim, floor_handle))
+
+    for obj in sim.getObjectsInTree(sim.handle_scene):
+        if sim.getObjectType(obj) != sim.object_shape_type:
+            continue
+
+        alias = sim.getObjectAlias(obj, 0)
+        if alias in ignore_aliases:
+            continue
+        if obj == robot_handle or is_descendant(sim, obj, robot_handle):
+            continue
+
+        x0 = sim.getObjectFloatParam(obj, sim.objfloatparam_objbbox_min_x)
+        x1 = sim.getObjectFloatParam(obj, sim.objfloatparam_objbbox_max_x)
+        y0 = sim.getObjectFloatParam(obj, sim.objfloatparam_objbbox_min_y)
+        y1 = sim.getObjectFloatParam(obj, sim.objfloatparam_objbbox_max_y)
+
+        if (x1 - x0) > big_limit or (y1 - y0) > big_limit:
+            continue
+
+        pts.extend(bounding_box_to_points(sim, obj))
+
+    return unique_points(pts)
+
+
+def is_descendant(sim, current_handle, target_parent):
+    while current_handle != -1:
+        if current_handle == target_parent:
+            return True
+        current_handle = sim.getObjectParent(current_handle)
+    return False
+
+
+def read_sensor_cloud(sim, sensor_handles):
+    hits = []
+    for sensor in sensor_handles:
+        res, dist, local_pt, _, _ = sim.readProximitySensor(sensor)
+        if res > 0:
+            pt = np.array(local_pt, dtype=float)
+            if np.linalg.norm(pt) <= 0.0 and dist > 0.0:
+                pt = np.array([dist, 0.0, 0.0], dtype=float)
+            mat = sim.getObjectMatrix(sensor, -1)
+            world_pt = np.array([
+                mat[0] * pt[0] + mat[1] * pt[1] + mat[2] * pt[2] + mat[3],
+                mat[4] * pt[0] + mat[5] * pt[1] + mat[6] * pt[2] + mat[7],
+                mat[8] * pt[0] + mat[9] * pt[1] + mat[10] * pt[2] + mat[11],
+            ], dtype=float)
+            hits.append([world_pt[0], world_pt[1]])
+    return np.array(hits, dtype=float)
+
+
+def local_obstacle_cloud(robot_xy, static_pts, live_pts, radius=1.4):
+    cloud = []
+    if static_pts is not None and len(static_pts) > 0:
+        dist = np.hypot(static_pts[:, 0] - robot_xy[0], static_pts[:, 1] - robot_xy[1])
+        cloud.extend(static_pts[dist <= radius].tolist())
+    if live_pts is not None and len(live_pts) > 0:
+        cloud.extend(live_pts.tolist())
+    return np.array(cloud, dtype=float)
+
+
 class DWAController:
     def __init__(self):
-        # Limites dinâmicos de velocidade
-        self.max_v = 0.20          
+        self.max_v = 0.20
         self.min_v = 0.0
-        self.max_yaw_rate = 0.70  # Renomeado max_w para expor o atributo exigido no robô
-        self.max_acceleration = 0.4 
-        self.max_steer_acceleration = 1.5          
-        
-        # Resoluções e tempos de amostragem
+        self.max_yaw_rate = 0.70
+        self.max_acceleration = 0.4
+        self.max_steer_acceleration = 1.5
+
         self.v_resolution = 0.02
         self.w_resolution = 0.08
         self.dt = 0.1
         self.prediction_time = 2.5
 
-        # Dimensões de segurança do robô
         self.robot_radius = 0.24
         self.collision_radius = 0.16
         self.safety_margin = 0.06
 
-        # Pesos das funções de custo
-        self.weight_goal = 0.40         
+        self.weight_goal = 0.40
         self.weight_speed = 1.0
         self.weight_obstacle = 0.45
         self.weight_distance = 2.2
 
     def calculate_dynamic_window(self, current_v, current_w):
-        """Calcula a janela dinâmica com base nos limites físicos e aceleração."""
-        absolute_limits = [self.min_v, self.max_v, -self.max_yaw_rate, self.max_yaw_rate]
-        acceleration_limits = [
-            current_v - self.max_acceleration * self.dt,
-            current_v + self.max_acceleration * self.dt,
-            current_w - self.max_steer_acceleration * self.dt,
-            current_w + self.max_steer_acceleration * self.dt,
-        ]
-        return [
-            max(absolute_limits[0], acceleration_limits[0]),
-            min(absolute_limits[1], acceleration_limits[1]),
-            max(absolute_limits[2], acceleration_limits[2]),
-            min(absolute_limits[3], acceleration_limits[3]),
-        ]
+        v0 = max(self.min_v, current_v - self.max_acceleration * self.dt)
+        v1 = min(self.max_v, current_v + self.max_acceleration * self.dt)
+        w0 = max(-self.max_yaw_rate, current_w - self.max_steer_acceleration * self.dt)
+        w1 = min(self.max_yaw_rate, current_w + self.max_steer_acceleration * self.dt)
+        return [v0, v1, w0, w1]
 
     def process_motion_step(self, pose, v, w):
-        """Aplica o modelo cinemático diferencial para predizer o próximo estado."""
-        next_pose = np.array(pose, dtype=float)
-        next_pose[2] = normalize_angle(next_pose[2] + w * self.dt)
-        next_pose[0] += v * math.cos(next_pose[2]) * self.dt
-        next_pose[1] += v * math.sin(next_pose[2]) * self.dt
-        return next_pose
+        return diff_drive_predict(pose, v, w, self.dt)
 
     def generate_predicted_trajectory(self, initial_pose, v, w):
-        """Gera uma matriz contendo toda a trajetória simulada adiante."""
-        current_pose = np.array(initial_pose, dtype=float)
-        trajectory = [current_pose.copy()]
-        
-        time_steps = np.arange(0.0, self.prediction_time + self.dt, self.dt)
-        for _ in time_steps:
-            current_pose = self.process_motion_step(current_pose, v, w)
-            trajectory.append(current_pose.copy())
-            
-        return np.array(trajectory)
+        state = np.array(initial_pose, dtype=float)
+        path = [state.copy()]
+        for _ in np.arange(0.0, self.prediction_time + self.dt, self.dt):
+            state = self.process_motion_step(state, v, w)
+            path.append(state.copy())
+        return np.array(path)
 
     def evaluate_goal_cost(self, trajectory, goal_xy):
-        """Calcula o custo de alinhamento angular com o objetivo final."""
-        last_pose = trajectory[-1]
-        angle_to_goal = math.atan2(goal_xy[1] - last_pose[1], goal_xy[0] - last_pose[0])
-        return abs(normalize_angle(angle_to_goal - last_pose[2]))
+        end = trajectory[-1]
+        desired = math.atan2(goal_xy[1] - end[1], goal_xy[0] - end[0])
+        return abs(angle_wrap(desired - end[2]))
 
     def evaluate_obstacle_cost(self, trajectory, obstacles, v):
-        """Mapeia a proximidade de obstáculos retornando infinito caso haja colisão."""
         if obstacles is None or len(obstacles) == 0:
             return 0.0
 
-        # Vetorização do cálculo de distância euclidiana para todos os obstáculos
-        diff_x = trajectory[:, 0:1] - obstacles[:, 0]
-        diff_y = trajectory[:, 1:2] - obstacles[:, 1]
-        distances = np.hypot(diff_x, diff_y)
-        min_distance = float(np.min(distances))
+        dx = trajectory[:, 0:1] - obstacles[:, 0]
+        dy = trajectory[:, 1:2] - obstacles[:, 1]
+        min_dist = float(np.min(np.hypot(dx, dy)))
 
-        braking_distance = (v * v) / (2.0 * self.max_acceleration) if self.max_acceleration > 0 else 0.0
-        clearance_zone = self.robot_radius + self.safety_margin + 0.5 * braking_distance
+        brake = (v * v) / (2.0 * self.max_acceleration) if self.max_acceleration > 0 else 0.0
+        safe = self.robot_radius + self.safety_margin + 0.5 * brake
 
-        if min_distance <= self.collision_radius:
+        if min_dist <= self.collision_radius:
             return float("inf")
 
-        cost = 1.0 / (min_distance - self.collision_radius)
-        if min_distance < clearance_zone:
-            cost += 8.0 * (clearance_zone - min_distance) / clearance_zone
-
+        cost = 1.0 / (min_dist - self.collision_radius)
+        if min_dist < safe:
+            cost += 8.0 * (safe - min_dist) / safe
         return cost
 
     def plan(self, pose, current_v, current_w, goal_xy, obstacles):
-        """Varre o espaço de comandos admissíveis selecionando a melhor velocidade linear e angular."""
         dw = self.calculate_dynamic_window(current_v, current_w)
-        best_control = [0.0, 0.0]
-        best_trajectory = self.generate_predicted_trajectory(pose, 0.0, 0.0)
-        minimum_cost = float("inf")
-        initial_distance_to_goal = math.hypot(goal_xy[0] - pose[0], goal_xy[1] - pose[1])
+        best_u = [0.0, 0.0]
+        best_traj = self.generate_predicted_trajectory(pose, 0.0, 0.0)
+        best_cost = float("inf")
+        start_dist = math.hypot(goal_xy[0] - pose[0], goal_xy[1] - pose[1])
 
-        v_candidates = np.arange(dw[0], dw[1] + self.v_resolution, self.v_resolution)
-        w_candidates = np.arange(dw[2], dw[3] + self.w_resolution, self.w_resolution)
+        v_set = np.arange(dw[0], dw[1] + self.v_resolution, self.v_resolution)
+        w_set = np.arange(dw[2], dw[3] + self.w_resolution, self.w_resolution)
 
-        for cv in v_candidates:
-            if cv > dw[1]:
+        for v in v_set:
+            if v > dw[1]:
                 continue
-            for cw in w_candidates:
-                if cw > dw[3]:
+            for w in w_set:
+                if w > dw[3]:
                     continue
 
-                trajectory = self.generate_predicted_trajectory(pose, cv, cw)
-                obstacle_cost = self.evaluate_obstacle_cost(trajectory, obstacles, cv)
-                
-                if math.isinf(obstacle_cost):
+                traj = self.generate_predicted_trajectory(pose, v, w)
+                obst_cost = self.evaluate_obstacle_cost(traj, obstacles, v)
+                if math.isinf(obst_cost):
                     continue
 
-                goal_cost = self.weight_goal * self.evaluate_goal_cost(trajectory, goal_xy)
-                speed_cost = self.weight_speed * (self.max_v - cv)
-                
-                final_distance_to_goal = math.hypot(goal_xy[0] - trajectory[-1, 0], goal_xy[1] - trajectory[-1, 1])
-                distance_cost = self.weight_distance * final_distance_to_goal
-                
-                progress_reward = 2.0 * max(0.0, initial_distance_to_goal - final_distance_to_goal)
+                goal_cost = self.weight_goal * self.evaluate_goal_cost(traj, goal_xy)
+                speed_cost = self.weight_speed * (self.max_v - v)
+                end_dist = math.hypot(goal_xy[0] - traj[-1, 0], goal_xy[1] - traj[-1, 1])
+                dist_cost = self.weight_distance * end_dist
+                reward = 2.0 * max(0.0, start_dist - end_dist)
 
-                total_cost = goal_cost + speed_cost + (self.weight_obstacle * obstacle_cost) + distance_cost - progress_reward
+                total = goal_cost + speed_cost + (self.weight_obstacle * obst_cost) + dist_cost - reward
 
-                if total_cost < minimum_cost:
-                    minimum_cost = total_cost
-                    best_control = [float(cv), float(cw)]
-                    best_trajectory = trajectory
+                if total < best_cost:
+                    best_cost = total
+                    best_u = [float(v), float(w)]
+                    best_traj = traj
 
-        # Estratégia de Fallback: Se todas as trajetórias colidirem, o robô rotaciona no próprio eixo em direção ao alvo
-        if math.isinf(minimum_cost):
-            angle_to_goal = math.atan2(goal_xy[1] - pose[1], goal_xy[0] - pose[0])
-            yaw_error = normalize_angle(angle_to_goal - pose[2])
-            best_control = [0.08, 0.8 if yaw_error >= 0.0 else -0.8]
-            best_trajectory = self.generate_predicted_trajectory(pose, best_control[0], best_control[1])
+        if math.isinf(best_cost):
+            heading = math.atan2(goal_xy[1] - pose[1], goal_xy[0] - pose[0])
+            err = angle_wrap(heading - pose[2])
+            best_u = [0.08, 0.8 if err >= 0.0 else -0.8]
+            best_traj = self.generate_predicted_trajectory(pose, best_u[0], best_u[1])
 
-        return best_control, best_trajectory
+        return best_u, best_traj
 
 
-# ==========================================================================
-#  PLANEJADOR GLOBAL - A* (ALGORITMO DE TRAJETÓRIA OTIMIZADA COM SMOOTHING)
-# ==========================================================================
-# ==========================================================================
-#  PLANEJADOR GLOBAL - A* (ALGORITMO DE TRAJETÓRIA OTIMIZADA COM SMOOTHING)
-# ==========================================================================
 class AStarPlanner:
     class GridNode:
         def __init__(self, x_idx, y_idx, cost, parent_id):
@@ -164,57 +243,58 @@ class AStarPlanner:
             self.cost = cost
             self.parent_id = parent_id
 
-    # CORREÇÃO: Mantido o parâmetro como 'rr' para compatibilidade com o main_robo.py
     def __init__(self, ox, oy, resolution=0.1, rr=0.28):
         self.resolution = resolution
-        self.robot_radius = rr  # Mapeia internamente para a lógica do código
-        
+        self.robot_radius = rr
+
         self.min_x = math.floor(min(ox))
         self.min_y = math.floor(min(oy))
         self.max_x = math.ceil(max(ox))
         self.max_y = math.ceil(max(oy))
-        
+
         self.width_x = round((self.max_x - self.min_x) / self.resolution)
         self.width_y = round((self.max_y - self.min_y) / self.resolution)
-        
-        # Vetores direcionais de deslocamento discreto [dx, dy, custo_da_ação]
+
         self.motion_directions = [
             [1, 0, 1.0], [0, 1, 1.0], [-1, 0, 1.0], [0, -1, 1.0],
             [1, 1, math.sqrt(2)], [1, -1, math.sqrt(2)],
             [-1, 1, math.sqrt(2)], [-1, -1, math.sqrt(2)],
         ]
-        
+
         self.obstacle_map = [[False for _ in range(self.width_y)] for _ in range(self.width_x)]
         self.inflation_cells = math.ceil(self.robot_radius / self.resolution)
         self.last_plan_failed = False
 
-        # Constrói a matriz de ocupação inflando as células baseada no raio do robô
-        for iox, ioy in zip(ox, oy):
-            center_x = self.coordinate_to_index(iox, self.min_x)
-            center_y = self.coordinate_to_index(ioy, self.min_y)
-            
-            for ix in range(center_x - self.inflation_cells, center_x + self.inflation_cells + 1):
-                for iy in range(center_y - self.inflation_cells, center_y + self.inflation_cells + 1):
+        for ox_i, oy_i in zip(ox, oy):
+            cx = self.coordinate_to_index(ox_i, self.min_x)
+            cy = self.coordinate_to_index(oy_i, self.min_y)
+            for ix in range(cx - self.inflation_cells, cx + self.inflation_cells + 1):
+                for iy in range(cy - self.inflation_cells, cy + self.inflation_cells + 1):
                     if ix < 0 or iy < 0 or ix >= self.width_x or iy >= self.width_y:
                         continue
-                    
-                    pos_x = self.index_to_coordinate(ix, self.min_x)
-                    pos_y = self.index_to_coordinate(iy, self.min_y)
-                    
-                    if math.hypot(iox - pos_x, ioy - pos_y) <= self.robot_radius:
+                    px = self.index_to_coordinate(ix, self.min_x)
+                    py = self.index_to_coordinate(iy, self.min_y)
+                    if math.hypot(ox_i - px, oy_i - py) <= self.robot_radius:
                         self.obstacle_map[ix][iy] = True
 
     def planning(self, start_x, start_y, goal_x, goal_y):
-        """Executa a busca A* com heurística dinâmica inflada."""
-        start_node = self.GridNode(self.coordinate_to_index(start_x, self.min_x), 
-                                   self.coordinate_to_index(start_y, self.min_y), 0.0, -1)
-        goal_node = self.GridNode(self.coordinate_to_index(goal_x, self.min_x), 
-                                  self.coordinate_to_index(goal_y, self.min_y), 0.0, -1)
-        
+        start_node = self.GridNode(
+            self.coordinate_to_index(start_x, self.min_x),
+            self.coordinate_to_index(start_y, self.min_y),
+            0.0,
+            -1,
+        )
+        goal_node = self.GridNode(
+            self.coordinate_to_index(goal_x, self.min_x),
+            self.coordinate_to_index(goal_y, self.min_y),
+            0.0,
+            -1,
+        )
+
         self.last_plan_failed = False
-        clear_radius = self.inflation_cells + 1
-        self.force_clear_cells(start_node.x, start_node.y, clear_radius)
-        self.force_clear_cells(goal_node.x, goal_node.y, clear_radius)
+        pad = self.inflation_cells + 1
+        self.force_clear_cells(start_node.x, start_node.y, pad)
+        self.force_clear_cells(goal_node.x, goal_node.y, pad)
 
         total_distance = max(math.hypot(goal_node.x - start_node.x, goal_node.y - start_node.y), 1e-6)
         open_set = {self.calculate_grid_id(start_node): start_node}
@@ -222,8 +302,9 @@ class AStarPlanner:
 
         while open_set:
             current_id = min(
-                open_set, 
-                key=lambda k: open_set[k].cost + (1.0 + math.hypot(goal_node.x - open_set[k].x, goal_node.y - open_set[k].y) / total_distance) * math.hypot(goal_node.x - open_set[k].x, goal_node.y - open_set[k].y)
+                open_set,
+                key=lambda k: open_set[k].cost + (1.0 + math.hypot(goal_node.x - open_set[k].x, goal_node.y - open_set[k].y) / total_distance)
+                * math.hypot(goal_node.x - open_set[k].x, goal_node.y - open_set[k].y),
             )
             current_node = open_set[current_id]
 
@@ -237,8 +318,12 @@ class AStarPlanner:
             closed_set[current_id] = current_node
 
             for dx, dy, movement_cost in self.motion_directions:
-                neighbor = self.GridNode(current_node.x + dx, current_node.y + dy, 
-                                         current_node.cost + movement_cost, current_id)
+                neighbor = self.GridNode(
+                    current_node.x + dx,
+                    current_node.y + dy,
+                    current_node.cost + movement_cost,
+                    current_id,
+                )
                 neighbor_id = self.calculate_grid_id(neighbor)
 
                 if not self.is_valid_node(neighbor) or neighbor_id in closed_set:
@@ -251,18 +336,19 @@ class AStarPlanner:
         return self.apply_post_processing([start_x, goal_x], [start_y, goal_y])
 
     def apply_post_processing(self, raw_x, raw_y):
-        """Aplica simplificações geométricas e suavização por curvas de Bezier."""
-        path_coordinates = list(zip(raw_x, raw_y))
-        if len(path_coordinates) <= 2:
-            return raw_x, raw_y, [pt[0] for pt in path_coordinates], [pt[1] for pt in path_coordinates]
+        coords = list(zip(raw_x, raw_y))
+        if len(coords) <= 2:
+            return raw_x, raw_y, [p[0] for p in coords], [p[1] for p in coords]
 
-        key_points = self._remove_collinear_nodes(path_coordinates)
+        key_points = self._remove_collinear_nodes(coords)
         key_points = self._compress_by_line_of_sight(key_points)
-        smoothed_path = self._generate_bezier_curves(key_points)
+        smooth = self._generate_bezier_curves(key_points)
 
         return (
-            [pt[0] for pt in smoothed_path], [pt[1] for pt in smoothed_path],
-            [pt[0] for pt in key_points], [pt[1] for pt in key_points]
+            [p[0] for p in smooth],
+            [p[1] for p in smooth],
+            [p[0] for p in key_points],
+            [p[1] for p in key_points],
         )
 
     @staticmethod
@@ -297,16 +383,16 @@ class AStarPlanner:
         xa, ya = point_a
         xb, yb = point_b
         segment_len = math.hypot(xb - xa, yb - ya)
-        sampling_steps = max(2, int(segment_len / (self.resolution * 0.5)) + 1)
+        samples = max(2, int(segment_len / (self.resolution * 0.5)) + 1)
 
-        for step in range(sampling_steps + 1):
-            ratio = step / sampling_steps
-            check_x = self.coordinate_to_index(xa + (xb - xa) * ratio, self.min_x)
-            check_y = self.coordinate_to_index(ya + (yb - ya) * ratio, self.min_y)
-            
-            if check_x < 0 or check_y < 0 or check_x >= self.width_x or check_y >= self.width_y:
+        for step in range(samples + 1):
+            ratio = step / samples
+            ix = self.coordinate_to_index(xa + (xb - xa) * ratio, self.min_x)
+            iy = self.coordinate_to_index(ya + (yb - ya) * ratio, self.min_y)
+
+            if ix < 0 or iy < 0 or ix >= self.width_x or iy >= self.width_y:
                 return False
-            if self.obstacle_map[check_x][check_y]:
+            if self.obstacle_map[ix][iy]:
                 return False
         return True
 
@@ -314,7 +400,7 @@ class AStarPlanner:
     def _generate_bezier_curves(control_points, density_samples=12, interpolation_ratio=0.35):
         if len(control_points) <= 2:
             return list(control_points)
-        
+
         vectors = [np.array(pt, dtype=float) for pt in control_points]
         interpolated_path = [tuple(vectors[0])]
 
@@ -337,13 +423,13 @@ class AStarPlanner:
         ordered_x = [self.index_to_coordinate(end_node.x, self.min_x)]
         ordered_y = [self.index_to_coordinate(end_node.y, self.min_y)]
         trace_id = end_node.parent_id
-        
+
         while trace_id != -1:
             node = evaluated_nodes[trace_id]
             ordered_x.append(self.index_to_coordinate(node.x, self.min_x))
             ordered_y.append(self.index_to_coordinate(node.y, self.min_y))
             trace_id = node.parent_id
-            
+
         ordered_x.reverse()
         ordered_y.reverse()
         return ordered_x, ordered_y
