@@ -5,118 +5,125 @@ from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 import dwa_navigation as dw
 import mapa_ocupacao as mo
 
+
+OBJ = {
+    "motor_dir": "/MOTOR_DIREITO",
+    "motor_esq": "/MOTOR_ESQUERDO",
+    "alvo": "/Alvo",
+    "floor": "/Floor",
+    "sensors": [
+        "/SENSOR_MEIO",
+        "/SENSOR_DIAG_DIREITO",
+        "/SENSOR_DIAG_ESQUERDO",
+        "/SENSOR_DIREITO",
+        "/SENSOR_ESQUERDO",
+    ],
+    "ignore": {"Floor", "box", "Goal", "Target", "Alvo", "camera_grade_ocupacao"},
+}
+
 SINAL_FWD = +1
 
 
-class CoppeliaRobotNavigator:
+class NavegadorCoppelia:
     def __init__(self):
         self.client = RemoteAPIClient()
         self.sim = self.client.require("sim")
-        self.dwa = dw.DWAController()
-        
-        # Estrutura de chaves do contexto antigo
-        self.motor_r = None
-        self.motor_l = None
-        self.robot_handle = None
-        self.goal_handle = None
-        self.sensors = []
-        
-        self.state = np.zeros(5, dtype=float)
-        self.initial_z = 0.0
-        self.initial_roll = 0.0
-        self.initial_pitch = 0.0
-        self.heading_offset = 0.0
-        
-        self.goal_xy = [0.0, 0.0]
-        self.static_obstacles = np.empty((0, 2))
-        
-        # Variáveis estáticas de rota originais para o Matplotlib
-        self.global_path = []
-        self.key_points = []
-        self.rx = []
-        self.ry = []
-        self.kx = []
-        self.ky = []
-        
-        self.path_index = 0
-        self.step_count = 0
-        
-        self.stuck_reference = None
-        self.stuck_steps = 0
-        self.recovery_countdown = 0
+        self.planner = dw.DWAController()
 
-    def get_valid_object(self, path):
+        self.h_right = None
+        self.h_left = None
+        self.h_base = None
+        self.h_goal = None
+        self.h_sensors = []
+
+        self.x = np.zeros(5, dtype=float)
+        self.z0 = 0.0
+        self.r0 = 0.0
+        self.p0 = 0.0
+        self.yaw_shift = 0.0
+
+        self.goal = [0.0, 0.0]
+        self.map_pts = np.empty((0, 2), dtype=float)
+
+        self.path_full = []
+        self.path_key = []
+        self.path_x = []
+        self.path_y = []
+        self.key_x = []
+        self.key_y = []
+        self.path_i = 0
+
+        self.k = 0
+        self.last_anchor = None
+        self.stuck_n = 0
+        self.escape_n = 0
+
+    def h(self, path):
         try:
             return self.sim.getObject(path)
-        except Exception as err:
-            raise RuntimeError(f"Objeto ausente: {path}") from err
+        except Exception as e:
+            raise RuntimeError(f"Objeto ausente: {path}") from e
 
-    def is_descendant(self, current_handle, target_parent):
-        while current_handle != -1:
-            if current_handle == target_parent:
+    def child_of(self, obj, parent):
+        while obj != -1:
+            if obj == parent:
                 return True
-            current_handle = self.sim.getObjectParent(current_handle)
+            obj = self.sim.getObjectParent(obj)
         return False
 
-    def transform_point_3d(self, matrix, point):
+    def p3(self, M, p):
         return np.array([
-            matrix[0] * point[0] + matrix[1] * point[1] + matrix[2] * point[2] + matrix[3],
-            matrix[4] * point[0] + matrix[5] * point[1] + matrix[6] * point[2] + matrix[7],
-            matrix[8] * point[0] + matrix[9] * point[1] + matrix[10] * point[2] + matrix[11],
+            M[0] * p[0] + M[1] * p[1] + M[2] * p[2] + M[3],
+            M[4] * p[0] + M[5] * p[1] + M[6] * p[2] + M[7],
+            M[8] * p[0] + M[9] * p[1] + M[10] * p[2] + M[11],
         ], dtype=float)
 
-    def generate_bounding_box_points(self, x0, x1, y0, y1, step=0.06):
+    def rect_edges(self, x0, x1, y0, y1, step=0.06):
         pts = []
-        x = x0
-        while x <= x1:
-            pts.append([x, y0])
-            pts.append([x, y1])
-            x += step
-        y = y0
-        while y <= y1:
-            pts.append([x0, y])
-            pts.append([x1, y])
-            y += step
+        t = x0
+        while t <= x1:
+            pts.append([t, y0])
+            pts.append([t, y1])
+            t += step
+        t = y0
+        while t <= y1:
+            pts.append([x0, t])
+            pts.append([x1, t])
+            t += step
         return pts
 
-    def extract_filled_rectangle(self, matrix, x0, x1, y0, y1, step=0.04):
+    def rect_fill(self, M, x0, x1, y0, y1, step=0.04):
         pts = []
-        x = x0
-        while x <= x1:
-            y = y0
-            while y <= y1:
-                w_pt = self.transform_point_3d(matrix, [x, y, 0.0])
-                pts.append([w_pt[0], w_pt[1]])
-                y += step
-            x += step
+        xx = x0
+        while xx <= x1:
+            yy = y0
+            while yy <= y1:
+                wp = self.p3(M, [xx, yy, 0.0])
+                pts.append([wp[0], wp[1]])
+                yy += step
+            xx += step
         return pts
 
-    def build_fallback_obstacles(self):
-        points = []
-        floor = self.get_valid_object("/Floor")
-        f_pos = self.sim.getObjectPosition(floor, -1)
-        
-        f_x0 = self.sim.getObjectFloatParam(floor, self.sim.objfloatparam_objbbox_min_x)
-        f_x1 = self.sim.getObjectFloatParam(floor, self.sim.objfloatparam_objbbox_max_x)
-        f_y0 = self.sim.getObjectFloatParam(floor, self.sim.objfloatparam_objbbox_min_y)
-        f_y1 = self.sim.getObjectFloatParam(floor, self.sim.objfloatparam_objbbox_max_y)
-
-        points.extend(self.generate_bounding_box_points(
-            f_pos[0] + f_x0, f_pos[0] + f_x1, f_pos[1] + f_y0, f_pos[1] + f_y1
-        ))
+    def build_map_fallback(self):
+        pts = []
+        floor = self.h(OBJ["floor"])
+        fp = self.sim.getObjectPosition(floor, -1)
+        a = self.sim.getObjectFloatParam(floor, self.sim.objfloatparam_objbbox_min_x)
+        b = self.sim.getObjectFloatParam(floor, self.sim.objfloatparam_objbbox_max_x)
+        c = self.sim.getObjectFloatParam(floor, self.sim.objfloatparam_objbbox_min_y)
+        d = self.sim.getObjectFloatParam(floor, self.sim.objfloatparam_objbbox_max_y)
+        pts.extend(self.rect_edges(fp[0] + a, fp[0] + b, fp[1] + c, fp[1] + d))
 
         for obj in self.sim.getObjectsInTree(self.sim.handle_scene):
             if self.sim.getObjectType(obj) != self.sim.object_shape_type:
                 continue
-
             alias = self.sim.getObjectAlias(obj, 0)
-            if alias in {"Floor", "box", "Goal", "Target", "Alvo", "camera_grade_ocupacao"}:
+            if alias in OBJ["ignore"]:
+                continue
+            if obj == self.h_base or self.child_of(obj, self.h_base):
                 continue
 
-            if obj == self.robot_handle or self.is_descendant(obj, self.robot_handle):
-                continue
-
-            matrix = self.sim.getObjectMatrix(obj, -1)
+            M = self.sim.getObjectMatrix(obj, -1)
             x0 = self.sim.getObjectFloatParam(obj, self.sim.objfloatparam_objbbox_min_x)
             x1 = self.sim.getObjectFloatParam(obj, self.sim.objfloatparam_objbbox_max_x)
             y0 = self.sim.getObjectFloatParam(obj, self.sim.objfloatparam_objbbox_min_y)
@@ -125,268 +132,247 @@ class CoppeliaRobotNavigator:
             if (x1 - x0) > 4.5 or (y1 - y0) > 4.5:
                 continue
 
-            points.extend(self.extract_filled_rectangle(matrix, x0, x1, y0, y1))
+            pts.extend(self.rect_fill(M, x0, x1, y0, y1))
 
-        unique_pts = {(round(x, 2), round(y, 2)): [x, y] for x, y in points}
-        return np.array(list(unique_pts.values()), dtype=float)
+        uniq = {(round(x, 2), round(y, 2)): [x, y] for x, y in pts}
+        return np.array(list(uniq.values()), dtype=float)
 
-    def update_robot_state(self, linear_v=0.0, angular_w=0.0):
-        pos = self.sim.getObjectPosition(self.robot_handle, -1)
-        orientation = self.sim.getObjectOrientation(self.robot_handle, -1)
-        
+    def align_heading(self):
+        front = self.h_sensors[0]
+        M = self.sim.getObjectMatrix(front, -1)
+        sensor_yaw = math.atan2(M[6], M[2])
+        robot_yaw = self.sim.getObjectOrientation(self.h_base, -1)[2]
+        delta = sensor_yaw - robot_yaw
+        self.yaw_shift = math.atan2(math.sin(delta), math.cos(delta))
+        print("Offset (graus):", round(math.degrees(self.yaw_shift), 1))
+
+    def update_state(self, v=0.0, w=0.0):
+        pos = self.sim.getObjectPosition(self.h_base, -1)
+        ori = self.sim.getObjectOrientation(self.h_base, -1)
+        yaw = math.atan2(math.sin(ori[2]), math.cos(ori[2]))
         flip = 0.0 if SINAL_FWD >= 0 else math.pi
-        heading = math.atan2(math.sin(orientation[2]), math.cos(orientation[2]))
-        normalized_th = math.atan2(
-            math.sin(heading + self.heading_offset + flip),
-            math.cos(heading + self.heading_offset + flip)
-        )
-        self.state = np.array([pos[0], pos[1], normalized_th, linear_v, angular_w], dtype=float)
+        th = math.atan2(math.sin(yaw + self.yaw_shift + flip), math.cos(yaw + self.yaw_shift + flip))
+        self.x = np.array([pos[0], pos[1], th, v, w], dtype=float)
 
-    def compute_sensor_alignment(self):
-        front_sensor = self.sensors[0]
-        matrix = self.sim.getObjectMatrix(front_sensor, -1)
-        yaw_f = math.atan2(matrix[6], matrix[2])
-        yaw_m = self.sim.getObjectOrientation(self.robot_handle, -1)[2]
-        
-        diff = yaw_f - yaw_m
-        self.heading_offset = math.atan2(math.sin(diff), math.cos(diff))
-        print("Offset (graus):", round(math.degrees(self.heading_offset), 1))
+    def read_sensors(self):
+        out = []
+        for s in self.h_sensors:
+            trig, dist, local_pt, _, _ = self.sim.readProximitySensor(s)
+            if trig > 0:
+                p = np.array(local_pt, dtype=float)
+                if np.linalg.norm(p) <= 0.0 and dist > 0.0:
+                    p = np.array([dist, 0.0, 0.0], dtype=float)
+                M = self.sim.getObjectMatrix(s, -1)
+                wp = self.p3(M, p)
+                out.append([wp[0], wp[1]])
+        return np.array(out, dtype=float)
 
-    def read_proximity_sensors(self):
-        detected_points = []
-        for sensor in self.sensors:
-            triggered, dist, local_pt, _, _ = self.sim.readProximitySensor(sensor)
-            if triggered > 0:
-                pt_vector = np.array(local_pt, dtype=float)
-                if np.linalg.norm(pt_vector) <= 0.0 and dist > 0.0:
-                    pt_vector = np.array([dist, 0.0, 0.0], dtype=float)
-                
-                matrix = self.sim.getObjectMatrix(sensor, -1)
-                world_pt = self.transform_point_3d(matrix, pt_vector)
-                detected_points.append([world_pt[0], world_pt[1]])
-        return np.array(detected_points, dtype=float)
+    def local_obstacles(self):
+        cloud = []
+        if self.map_pts is not None and len(self.map_pts) > 0:
+            d = np.hypot(self.map_pts[:, 0] - self.x[0], self.map_pts[:, 1] - self.x[1])
+            cloud.extend(self.map_pts[d <= 1.4].tolist())
 
-    def aggregate_local_obstacles(self):
-        local_cloud = []
-        if self.static_obstacles is not None and len(self.static_obstacles) > 0:
-            distances = np.hypot(self.static_obstacles[:, 0] - self.state[0], self.static_obstacles[:, 1] - self.state[1])
-            local_cloud.extend(self.static_obstacles[distances <= 1.4].tolist())
+        live = self.read_sensors()
+        if len(live) > 0:
+            cloud.extend(live.tolist())
 
-        live_scans = self.read_proximity_sensors()
-        if len(live_scans) > 0:
-            local_cloud.extend(live_scans.tolist())
-            
-        return np.array(local_cloud, dtype=float)
+        return np.array(cloud, dtype=float)
 
-    def is_colliding(self, simulated_pose):
-        if self.static_obstacles is None or len(self.static_obstacles) == 0:
+    def collides(self, pose):
+        if self.map_pts is None or len(self.map_pts) == 0:
             return False
-        distances = np.hypot(self.static_obstacles[:, 0] - simulated_pose[0], self.static_obstacles[:, 1] - simulated_pose[1])
-        return float(np.min(distances)) <= self.dwa.collision_radius
+        d = np.hypot(self.map_pts[:, 0] - pose[0], self.map_pts[:, 1] - pose[1])
+        return float(np.min(d)) <= self.planner.collision_radius
 
-    def execute_global_planner(self):
-        sx, sy = float(self.state[0]), float(self.state[1])
-        gx, gy = float(self.goal_xy[0]), float(self.goal_xy[1])
-        
-        for radius in (0.22, 0.18, 0.14):
-            planner = dw.AStarPlanner(
-                self.static_obstacles[:, 0].tolist(), 
-                self.static_obstacles[:, 1].tolist(), 
-                resolution=0.08, rr=radius
+    def global_plan(self):
+        sx, sy = float(self.x[0]), float(self.x[1])
+        gx, gy = float(self.goal[0]), float(self.goal[1])
+
+        for rr in (0.22, 0.18, 0.14):
+            ap = dw.AStarPlanner(
+                self.map_pts[:, 0].tolist(),
+                self.map_pts[:, 1].tolist(),
+                resolution=0.08,
+                rr=rr,
             )
-            self.rx, self.ry, self.kx, self.ky = planner.planning(sx, sy, gx, gy)
-            if not planner.last_plan_failed:
-                print(f"A* OK com rr={radius:.2f}")
+            self.path_x, self.path_y, self.key_x, self.key_y = ap.planning(sx, sy, gx, gy)
+            if not ap.last_plan_failed:
+                print(f"A* OK com rr={rr:.2f}")
                 break
-            print(f"A* falhou com rr={radius:.2f}")
+            print(f"A* falhou com rr={rr:.2f}")
         else:
             print("A* falhou geral, linha reta.")
-            self.rx, self.ry, self.kx, self.ky = [sx, gx], [sy, gy], [sx, gx], [sy, gy]
+            self.path_x, self.path_y, self.key_x, self.key_y = [sx, gx], [sy, gy], [sx, gx], [sy, gy]
 
-        self.global_path = list(zip(self.rx, self.ry))
-        self.key_points = list(zip(self.kx, self.ky))
-        self.path_index = 0
+        self.path_full = list(zip(self.path_x, self.path_y))
+        self.path_key = list(zip(self.key_x, self.key_y))
+        self.path_i = 0
 
-    def extract_dynamic_target(self):
-        path = self.global_path if self.global_path else [self.goal_xy]
-        while self.path_index < len(path) - 1:
-            current_target = path[self.path_index]
-            if math.hypot(current_target[0] - self.state[0], current_target[1] - self.state[1]) >= 0.40:
+    def target_point(self):
+        route = self.path_full if self.path_full else [self.goal]
+        while self.path_i < len(route) - 1:
+            pt = route[self.path_i]
+            if math.hypot(pt[0] - self.x[0], pt[1] - self.x[1]) >= 0.40:
                 break
-            self.path_index += 1
-        
-        idx = min(self.path_index + 2, len(path) - 1)
-        return path[idx]
+            self.path_i += 1
+        return route[min(self.path_i + 2, len(route) - 1)]
 
-    def drive_actuators(self, control_inputs):
-        v, w = float(control_inputs[0]), float(control_inputs[1])
-        dt = self.dwa.dt
-        wheel_radius, track_width = 0.0375, 0.15
+    def escape_cmd(self, tgt):
+        ang = math.atan2(tgt[1] - self.x[1], tgt[0] - self.x[0])
+        turn = math.atan2(math.sin(ang - self.x[2]), math.cos(ang - self.x[2]))
+        w = max(min(1.2 * turn, 4.0), -4.0)
+        if self.escape_n > 22:
+            return [0.07, 0.3 * w]
+        if abs(turn) > 0.25:
+            return [0.0, -0.8 if turn >= 0.0 else 0.8]
+        return [-0.10, 0.5 * w]
 
-        next_state = self.state.copy()
-        next_state[2] = math.atan2(math.sin(next_state[2] + w * dt), math.cos(next_state[2] + w * dt))
-        next_state[0] += v * math.cos(next_state[2]) * dt
-        next_state[1] += v * math.sin(next_state[2]) * dt
-        next_state[3], next_state[4] = v, w
+    def drive(self, cmd):
+        v, w = float(cmd[0]), float(cmd[1])
+        dt = self.planner.dt
+        R, L = 0.0375, 0.15
 
-        if self.is_colliding(next_state):
-            next_state = self.state.copy()
-            next_state[2] = math.atan2(math.sin(next_state[2] + w * dt), math.cos(next_state[2] + w * dt))
-            next_state[3], next_state[4] = 0.0, w
+        nxt = self.x.copy()
+        nxt[2] = math.atan2(math.sin(nxt[2] + w * dt), math.cos(nxt[2] + w * dt))
+        nxt[0] += v * math.cos(nxt[2]) * dt
+        nxt[1] += v * math.sin(nxt[2]) * dt
+        nxt[3], nxt[4] = v, w
+
+        if self.collides(nxt):
+            nxt = self.x.copy()
+            nxt[2] = math.atan2(math.sin(nxt[2] + w * dt), math.cos(nxt[2] + w * dt))
+            nxt[3], nxt[4] = 0.0, w
             v = 0.0
 
-        v_inv, w_inv = -v, -w
-        w_right = (2.0 * v_inv + w_inv * track_width) / (2.0 * wheel_radius)
-        w_left = (2.0 * v_inv - w_inv * track_width) / (2.0 * wheel_radius)
-        
-        w_right = max(min(w_right, 20.0), -20.0)
-        w_left = max(min(w_left, 20.0), -20.0)
+        vinv, winv = -v, -w
+        wr = (2.0 * vinv + winv * L) / (2.0 * R)
+        wl = (2.0 * vinv - winv * L) / (2.0 * R)
+        wr = max(min(wr, 20.0), -20.0)
+        wl = max(min(wl, 20.0), -20.0)
 
-        self.sim.setJointTargetVelocity(self.motor_r, w_right)
-        self.sim.setJointTargetVelocity(self.motor_l, w_left)
-        self.sim.setObjectPosition(self.robot_handle, -1, [next_state[0], next_state[1], self.initial_z])
+        self.sim.setJointTargetVelocity(self.h_right, wr)
+        self.sim.setJointTargetVelocity(self.h_left, wl)
+        self.sim.setObjectPosition(self.h_base, -1, [nxt[0], nxt[1], self.z0])
 
         flip = 0.0 if SINAL_FWD >= 0 else math.pi
-        computed_yaw = math.atan2(math.sin(next_state[2] - self.heading_offset - flip), 
-                                  math.cos(next_state[2] - self.heading_offset - flip))
-        
-        self.sim.setObjectOrientation(self.robot_handle, -1, [self.initial_roll, self.initial_pitch, computed_yaw])
-        
+        yaw_cmd = math.atan2(math.sin(nxt[2] - self.yaw_shift - flip), math.cos(nxt[2] - self.yaw_shift - flip))
+        self.sim.setObjectOrientation(self.h_base, -1, [self.r0, self.p0, yaw_cmd])
+
         try:
-            self.sim.resetDynamicObject(self.robot_handle)
+            self.sim.resetDynamicObject(self.h_base)
         except Exception:
             pass
 
         self.sim.step()
-        return next_state
+        return nxt
 
-    def load_static_map_data(self):
-        exclusions = [
-            (float(self.state[0]), float(self.state[1]), self.dwa.robot_radius + 0.15),
-            (float(self.goal_xy[0]), float(self.goal_xy[1]), self.dwa.robot_radius + 0.10),
-        ]
-        try:
-            floor_handle = self.get_valid_object("/Floor")
-            pts, grid, info = mo.construir_obstaculos_por_visao(self.sim, floor_handle, excluir=exclusions)
-            if len(pts) >= 4:
-                return pts
-        except Exception:
-            print("Usando fallback Bounding Box...")
-        return self.build_fallback_obstacles()
-
-    def render_static_chart(self):
-        if self.static_obstacles is None or len(self.static_obstacles) == 0:
+    def render(self):
+        if self.map_pts is None or len(self.map_pts) == 0:
             print("[Aviso] Não foi possível abrir o mapa pois os obstáculos não foram calculados.")
             return
 
-        floor = self.get_valid_object("/Floor")
-        f_pos = self.sim.getObjectPosition(floor, -1)
-        x0 = f_pos[0] + self.sim.getObjectFloatParam(floor, self.sim.objfloatparam_objbbox_min_x)
-        x1 = f_pos[0] + self.sim.getObjectFloatParam(floor, self.sim.objfloatparam_objbbox_max_x)
-        y0 = f_pos[1] + self.sim.getObjectFloatParam(floor, self.sim.objfloatparam_objbbox_min_y)
-        y1 = f_pos[1] + self.sim.getObjectFloatParam(floor, self.sim.objfloatparam_objbbox_max_y)
+        floor = self.h(OBJ["floor"])
+        fp = self.sim.getObjectPosition(floor, -1)
+        x0 = fp[0] + self.sim.getObjectFloatParam(floor, self.sim.objfloatparam_objbbox_min_x)
+        x1 = fp[0] + self.sim.getObjectFloatParam(floor, self.sim.objfloatparam_objbbox_max_x)
+        y0 = fp[1] + self.sim.getObjectFloatParam(floor, self.sim.objfloatparam_objbbox_min_y)
+        y1 = fp[1] + self.sim.getObjectFloatParam(floor, self.sim.objfloatparam_objbbox_max_y)
 
         print("\n---> ABRINDO O MAPA INICIAL <---")
         print("Analise as rotas geradas pelo A*. FECHE A JANELA DO GRÁFICO para iniciar a simulação no CoppeliaSim.\n")
 
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 5))
-        fig.suptitle("Planejamento Estático - A*", fontsize=12, fontweight='bold')
+        fig, axs = plt.subplots(1, 2, figsize=(11, 5))
+        fig.suptitle("Planejamento Estático - A*", fontsize=12, fontweight="bold")
 
-        obs_arr = np.array(self.static_obstacles)
-        path_arr = np.array(self.global_path)
-        kp_arr = np.array(self.key_points)
+        obs = np.array(self.map_pts)
+        route = np.array(self.path_full)
+        key = np.array(self.path_key)
 
-        for ax, t in zip([ax1, ax2], ["Rota Completa", "Pontos-Chave"]):
-            ax.set_title(t)
+        for ax, ttl in zip(axs, ["Rota Completa", "Pontos-Chave"]):
+            ax.set_title(ttl)
             ax.set_xlabel("X")
             ax.set_ylabel("Y")
             ax.grid(True)
             ax.axis("equal")
             ax.set_xlim(x0 - 0.1, x1 + 0.1)
             ax.set_ylim(y0 - 0.1, y1 + 0.1)
-            if len(obs_arr) > 0:
-                ax.scatter(obs_arr[:, 0], obs_arr[:, 1], s=4, c="black", marker="s")
-            ax.plot(self.state[0], self.state[1], "go", markersize=9)
-            ax.plot(self.goal_xy[0], self.goal_xy[1], "ro", markersize=9)
+            if len(obs) > 0:
+                ax.scatter(obs[:, 0], obs[:, 1], s=4, c="black", marker="s")
+            ax.plot(self.x[0], self.x[1], "go", markersize=9)
+            ax.plot(self.goal[0], self.goal[1], "ro", markersize=9)
 
-        if len(path_arr) > 0:
-            ax1.plot(path_arr[:, 0], path_arr[:, 1], "b-", linewidth=2)
-        if len(kp_arr) > 0:
-            ax2.plot(kp_arr[:, 0], kp_arr[:, 1], "y-x", markersize=8, linewidth=1.5)
+        if len(route) > 0:
+            axs[0].plot(route[:, 0], route[:, 1], "b-", linewidth=2)
+        if len(key) > 0:
+            axs[1].plot(key[:, 0], key[:, 1], "y-x", markersize=8, linewidth=1.5)
 
         plt.tight_layout()
         plt.show()
 
-    def bootstrap_system(self):
-        self.motor_r = self.get_valid_object("/MOTOR_DIREITO")
-        self.motor_l = self.get_valid_object("/MOTOR_ESQUERDO")
-        self.robot_handle = self.sim.getObjectParent(self.motor_r)
-        self.goal_handle = self.get_valid_object("/Alvo")
+    def init_scene(self):
+        self.h_right = self.h(OBJ["motor_dir"])
+        self.h_left = self.h(OBJ["motor_esq"])
+        self.h_base = self.sim.getObjectParent(self.h_right)
+        self.h_goal = self.h(OBJ["alvo"])
+        self.h_sensors = [self.h(p) for p in OBJ["sensors"]]
 
-        self.sensors = [
-            self.get_valid_object("/SENSOR_MEIO"),
-            self.get_valid_object("/SENSOR_DIAG_DIREITO"),
-            self.get_valid_object("/SENSOR_DIAG_ESQUERDO"),
-            self.get_valid_object("/SENSOR_DIREITO"),
-            self.get_valid_object("/SENSOR_ESQUERDO"),
+        pos = self.sim.getObjectPosition(self.h_base, -1)
+        ori = self.sim.getObjectOrientation(self.h_base, -1)
+        self.z0, self.r0, self.p0 = pos[2], ori[0], ori[1]
+
+        self.align_heading()
+        self.update_state()
+
+        gpos = self.sim.getObjectPosition(self.h_goal, -1)
+        self.goal = [gpos[0], gpos[1]]
+        self.map_pts = self._map()
+        self.k = 0
+        self.global_plan()
+
+    def _map(self):
+        ex = [
+            (float(self.x[0]), float(self.x[1]), self.planner.robot_radius + 0.15),
+            (float(self.goal[0]), float(self.goal[1]), self.planner.robot_radius + 0.10),
         ]
+        try:
+            floor = self.h(OBJ["floor"])
+            pts, _, _ = mo.construir_obstaculos_por_visao(self.sim, floor, excluir=ex)
+            if len(pts) >= 4:
+                return pts
+        except Exception:
+            print("Usando fallback Bounding Box...")
+        return self.build_map_fallback()
 
-        r_pos = self.sim.getObjectPosition(self.robot_handle, -1)
-        r_ori = self.sim.getObjectOrientation(self.robot_handle, -1)
-        self.initial_z, self.initial_roll, self.initial_pitch = r_pos[2], r_ori[0], r_ori[1]
+    def loop(self):
+        if self.h_goal is not None:
+            gpos = self.sim.getObjectPosition(self.h_goal, -1)
+            self.goal = [gpos[0], gpos[1]]
 
-        self.compute_sensor_alignment()
-        self.update_robot_state()
+        cloud = self.local_obstacles()
+        tgt = self.target_point()
 
-        g_pos = self.sim.getObjectPosition(self.goal_handle, -1)
-        self.goal_xy = [g_pos[0], g_pos[1]]
-        self.static_obstacles = self.load_static_map_data()
-        self.step_count = 0
-
-        self.execute_global_planner()
-
-    def calculate_escape_velocity(self, target_point):
-        ang = math.atan2(target_point[1] - self.state[1], target_point[0] - self.state[0])
-        turn = math.atan2(math.sin(ang - self.state[2]), math.cos(ang - self.state[2]))
-        
-        # Correção do Erro: Substituído o limite interno inexistente por valores manuais do seu código original
-        w = max(min(1.2 * turn, 4.0), -4.0) 
-        
-        if self.recovery_countdown > 22:
-            return [0.07, 0.3 * w]
-        if abs(turn) > 0.25:
-            return [0.0, -0.8 if turn >= 0.0 else 0.8]
-        return [-0.10, 0.5 * w]
-
-    def runtime_loop(self):
-        if self.goal_handle is not None:
-            g_pos = self.sim.getObjectPosition(self.goal_handle, -1)
-            self.goal_xy = [g_pos[0], g_pos[1]]
-
-        local_obs = self.aggregate_local_obstacles()
-        current_waypoint = self.extract_dynamic_target()
-
-        if self.stuck_reference is None or math.hypot(self.state[0] - self.stuck_reference[0], self.state[1] - self.stuck_reference[1]) > 0.05:
-            self.stuck_reference = (float(self.state[0]), float(self.state[1]))
-            self.stuck_steps = 0
+        if self.last_anchor is None or math.hypot(self.x[0] - self.last_anchor[0], self.x[1] - self.last_anchor[1]) > 0.05:
+            self.last_anchor = (float(self.x[0]), float(self.x[1]))
+            self.stuck_n = 0
         else:
-            self.stuck_steps += 1
+            self.stuck_n += 1
 
-        if self.recovery_countdown > 0:
-            control_actions = self.calculate_escape_velocity(current_waypoint)
-            self.recovery_countdown -= 1
+        if self.escape_n > 0:
+            cmd = self.escape_cmd(tgt)
+            self.escape_n -= 1
         else:
-            control_actions, _ = self.dwa.plan(self.state[0:3], self.state[3], self.state[4], current_waypoint, local_obs)
-            if self.stuck_steps >= 30:
+            cmd, _ = self.planner.plan(self.x[0:3], self.x[3], self.x[4], tgt, cloud)
+            if self.stuck_n >= 30:
                 print("Preso -> replanejando...")
-                self.execute_global_planner()
-                self.recovery_countdown = 35
-                self.stuck_steps = 0
+                self.global_plan()
+                self.escape_n = 35
+                self.stuck_n = 0
 
-        self.state = self.drive_actuators(control_actions)
-        self.step_count += 1
+        self.x = self.drive(cmd)
+        self.k += 1
 
-        if math.hypot(self.state[0] - self.goal_xy[0], self.state[1] - self.goal_xy[1]) <= 0.20:
+        if math.hypot(self.x[0] - self.goal[0], self.x[1] - self.goal[1]) <= 0.20:
             print("ALVO ATINGIDO!")
             return True
         return False
@@ -394,24 +380,23 @@ class CoppeliaRobotNavigator:
 
 if __name__ == "__main__":
     print("Conectando ao CoppeliaSim...")
-    navigator = CoppeliaRobotNavigator()
-    
-    navigator.bootstrap_system()
-    navigator.render_static_chart()
+    nav = NavegadorCoppelia()
+
+    nav.init_scene()
+    nav.render()
 
     print("Iniciando a simulação física...")
-    navigator.sim.setStepping(True)
-    navigator.sim.startSimulation()
+    nav.sim.setStepping(True)
+    nav.sim.startSimulation()
 
     try:
-        while not navigator.runtime_loop():
+        while not nav.loop():
             pass
     except KeyboardInterrupt:
         print("Interrompido pelo usuário.")
     finally:
-        if navigator.motor_r and navigator.motor_l:
-            navigator.sim.setJointTargetVelocity(navigator.motor_r, 0.0)
-            navigator.sim.setJointTargetVelocity(navigator.motor_l, 0.0)
-        
-        navigator.sim.stopSimulation()
+        if nav.h_right and nav.h_left:
+            nav.sim.setJointTargetVelocity(nav.h_right, 0.0)
+            nav.sim.setJointTargetVelocity(nav.h_left, 0.0)
+        nav.sim.stopSimulation()
         print("Simulação encerrada e finalizada.")
