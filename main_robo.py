@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 import dwa_navigation as dw
-import mapa_ocupacao as mo
+import mapa_cena as mo
 
 
 OBJ = {
